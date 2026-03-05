@@ -108,6 +108,11 @@ class PtyTerminalProxy extends TerminalProxyBase {
       )
     }
 
+    // Hide status bar and disable prefix key on grouped sessions.
+    try { this.runTmux(['set-option', '-t', this.options.sessionName, 'status', 'off']) } catch {}
+    try { this.runTmux(['set-option', '-t', this.options.sessionName, 'prefix', 'None']) } catch {}
+    try { this.runTmux(['set-option', '-t', this.options.sessionName, 'prefix2', 'None']) } catch {}
+
     // Grouped sessions get their own session options from the global default,
     // not from the base session. Copy the base session's mouse setting so
     // SGR mouse sequences from the browser aren't silently dropped.

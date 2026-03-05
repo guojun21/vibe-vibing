@@ -30,6 +30,9 @@ function createTmuxSession(name: string, dir: string, program: string): void {
   const shellCmd = `export PATH="$HOME/.claude/local:$HOME/.local/bin:$PATH"; exec ${program}`
   runTmux(['new-session', '-d', '-s', name, '-c', dir, '-x', '120', '-y', '40', '--', 'zsh', '-c', shellCmd])
   try { runTmux(['set-option', '-t', name, 'history-limit', '10000']) } catch {}
+  try { runTmux(['set-option', '-t', name, 'status', 'off']) } catch {}
+  try { runTmux(['set-option', '-t', name, 'prefix', 'None']) } catch {}
+  try { runTmux(['set-option', '-t', name, 'prefix2', 'None']) } catch {}
 }
 
 function capturePaneContent(session: string): string {
