@@ -36,11 +36,35 @@ export interface DAMessage {
   timestamp: string
 }
 
+export interface DAToolCallInfo {
+  id: string
+  name: string
+  arguments: string
+}
+
+export interface DAToolResultInfo {
+  id: string
+  name: string
+  output: string
+  isError: boolean
+}
+
+export interface DAAgentEvent {
+  type: 'thinking' | 'tool-call' | 'tool-result' | 'complete' | 'error'
+  step: number
+  content?: string
+  toolCalls?: DAToolCallInfo[]
+  toolResults?: DAToolResultInfo[]
+  timestamp: string
+}
+
 interface TeamState {
   teams: Team[]
   selectedTeamId: string | null
   teamStatuses: Record<string, TeamRuntimeStatus>
   daMessages: Record<string, DAMessage[]>
+  daAgentEvents: Record<string, DAAgentEvent[]>
+  daAgentRunning: Record<string, boolean>
   creatingTeam: boolean
 
   setTeams: (teams: Team[]) => void
@@ -50,6 +74,9 @@ interface TeamState {
   setTeamStatus: (status: TeamRuntimeStatus) => void
   setDAMessages: (teamId: string, messages: DAMessage[]) => void
   addDAMessage: (teamId: string, message: DAMessage) => void
+  addDAAgentEvent: (teamId: string, event: DAAgentEvent) => void
+  clearDAAgentEvents: (teamId: string) => void
+  setDAAgentRunning: (teamId: string, running: boolean) => void
   setCreatingTeam: (creating: boolean) => void
 }
 
@@ -60,6 +87,8 @@ export const useTeamStore = create<TeamState>()(
       selectedTeamId: null,
       teamStatuses: {},
       daMessages: {},
+      daAgentEvents: {},
+      daAgentRunning: {},
       creatingTeam: false,
 
       setTeams: (teams) => set({ teams }),
@@ -83,6 +112,21 @@ export const useTeamStore = create<TeamState>()(
             ...state.daMessages,
             [teamId]: [...(state.daMessages[teamId] || []), message],
           },
+        })),
+      addDAAgentEvent: (teamId, event) =>
+        set((state) => ({
+          daAgentEvents: {
+            ...state.daAgentEvents,
+            [teamId]: [...(state.daAgentEvents[teamId] || []), event],
+          },
+        })),
+      clearDAAgentEvents: (teamId) =>
+        set((state) => ({
+          daAgentEvents: { ...state.daAgentEvents, [teamId]: [] },
+        })),
+      setDAAgentRunning: (teamId, running) =>
+        set((state) => ({
+          daAgentRunning: { ...state.daAgentRunning, [teamId]: running },
         })),
       setCreatingTeam: (creating) => set({ creatingTeam: creating }),
     }),

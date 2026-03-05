@@ -80,6 +80,9 @@ export default function App() {
     setTeamStatus,
     setDAMessages,
     addDAMessage,
+    addDAAgentEvent,
+    clearDAAgentEvents,
+    setDAAgentRunning,
   } = useTeamStore()
 
   const theme = useThemeStore((state) => state.theme)
@@ -338,6 +341,10 @@ export default function App() {
       }
       if (message.type === 'team-created') {
         addTeam(message.team)
+        const { selectedTeamId } = useTeamStore.getState()
+        if (!selectedTeamId) {
+          useTeamStore.getState().selectTeam(message.team.teamId)
+        }
       }
       if (message.type === 'team-updated') {
         updateTeamInStore(message.team)
@@ -350,6 +357,54 @@ export default function App() {
       }
       if (message.type === 'da-history') {
         setDAMessages(message.teamId, message.messages)
+      }
+      if ((message as any).type === 'da-thinking') {
+        const msg = message as any
+        setDAAgentRunning(msg.teamId, true)
+        addDAAgentEvent(msg.teamId, {
+          type: 'thinking',
+          step: msg.step,
+          content: msg.content,
+          timestamp: new Date().toISOString(),
+        })
+      }
+      if ((message as any).type === 'da-tool-call') {
+        const msg = message as any
+        addDAAgentEvent(msg.teamId, {
+          type: 'tool-call',
+          step: msg.step,
+          toolCalls: msg.toolCalls,
+          timestamp: new Date().toISOString(),
+        })
+      }
+      if ((message as any).type === 'da-tool-result') {
+        const msg = message as any
+        addDAAgentEvent(msg.teamId, {
+          type: 'tool-result',
+          step: msg.step,
+          toolResults: msg.results,
+          timestamp: new Date().toISOString(),
+        })
+      }
+      if ((message as any).type === 'da-complete') {
+        const msg = message as any
+        setDAAgentRunning(msg.teamId, false)
+        addDAAgentEvent(msg.teamId, {
+          type: 'complete',
+          step: 0,
+          content: msg.summary,
+          timestamp: new Date().toISOString(),
+        })
+      }
+      if ((message as any).type === 'da-error') {
+        const msg = message as any
+        setDAAgentRunning(msg.teamId, false)
+        addDAAgentEvent(msg.teamId, {
+          type: 'error',
+          step: 0,
+          content: msg.error,
+          timestamp: new Date().toISOString(),
+        })
       }
     })
 
@@ -613,8 +668,8 @@ export default function App() {
 
       {/* Main content: SplitView or single Terminal */}
       {splitViewEnabled && pinnedSessions.length > 0 ? (
-        <div className="flex-1 min-w-0 min-h-0 h-full overflow-hidden p-1">
-          <SplitView pinnedSessions={pinnedSessions} />
+        <div className="flex-1 min-w-0 min-h-0 h-full overflow-hidden">
+          <SplitView pinnedSessions={pinnedSessions} sendMessage={sendMessage} />
         </div>
       ) : (
         <Terminal

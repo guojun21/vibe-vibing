@@ -11,6 +11,7 @@ import DAPanel from './delegate-agent-chat-panel'
 
 interface Props {
   pinnedSessions: Session[]
+  sendMessage?: (message: any) => void
 }
 
 function useResizer(
@@ -75,7 +76,7 @@ function HorizontalHandle({ onMouseDown }: { onMouseDown: React.MouseEventHandle
   )
 }
 
-export default function SplitView({ pinnedSessions }: Props) {
+export default function SplitView({ pinnedSessions, sendMessage }: Props) {
   const { fraction: hFrac, containerRef, onMouseDown: hDrag } = useResizer(
     'horizontal',
     0.25,
@@ -114,7 +115,7 @@ export default function SplitView({ pinnedSessions }: Props) {
     <div ref={containerRef} className="flex h-full w-full min-h-0 overflow-hidden">
       {/* Left: DA Panel */}
       <div style={{ width: leftPct, minWidth: 200 }} className="shrink-0 h-full min-h-0 overflow-hidden">
-        <DAPanel onSendToAll={handleSendToAll} />
+        <DAPanel onSendToAll={handleSendToAll} sendMessage={sendMessage} />
       </div>
 
       <HorizontalHandle onMouseDown={hDrag} />

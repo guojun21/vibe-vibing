@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { useTeamStore, type Team, type TeamRuntimeStatus } from '../stores/team-state-store'
 import { InlineTeamCreator } from './inline-team-creator'
 import { TeamItem } from './team-item'
@@ -40,6 +41,12 @@ export function TeamSidebar({ sendMessage }: TeamSidebarProps) {
     sendMessage({ type: 'team-create', name, members, defaultProjectPath })
     setCreatingTeam(false)
   }
+
+  useEffect(() => {
+    if (!selectedTeamId && activeTeams.length > 0) {
+      selectTeam(activeTeams[0].teamId)
+    }
+  }, [selectedTeamId, activeTeams, selectTeam])
 
   return (
     <div data-testid="team-sidebar" className="flex flex-col h-full bg-[#0d1117] text-white/80">

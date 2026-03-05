@@ -11,6 +11,7 @@ import {
   handleDAInput,
   type DelegateAgentOrchestrator,
 } from './delegate-agent-orchestrator'
+import { runAgentLoop, abortAgentLoop, type AgentLoopCallbacks } from './da-agent-loop'
 import * as teamRepo from './database/team-repository'
 import * as sessionRepo from './database/session-repository'
 import * as messageRepo from './database/message-repository'
@@ -23,6 +24,8 @@ export interface TeamRuntime {
   ccSessionIds: Map<string, string>
   daSessionId: string
 }
+
+export { abortAgentLoop }
 
 const activeTeams = new Map<string, TeamRuntime>()
 
@@ -159,7 +162,8 @@ export async function stopTeam(teamId: string): Promise<void> {
 export async function sendDAInput(
   teamId: string,
   text: string,
-): Promise<{ errors: string[]; messageId: string }> {
+  callbacks: AgentLoopCallbacks,
+): Promise<{ messageId: string }> {
   const startMs = Date.now()
   const runtime = activeTeams.get(teamId)
   if (!runtime) {
@@ -167,7 +171,7 @@ export async function sendDAInput(
     throw new Error(`Team ${teamId} is not running`)
   }
 
-  logger.info({ teamId, textLen: text.length, textPreview: text.slice(0, 80), ccTargets: runtime.ccInstances.map(i => i.name), event: 'da_input_processing' })
+  logger.info({ teamId, textLen: text.length, textPreview: text.slice(0, 80), ccTargets: runtime.ccInstances.map(i => i.name), event: 'da_input_via_agent_loop' })
 
   const userMsg = await messageRepo.insertMessage({
     sessionId: runtime.daSessionId,
@@ -179,6 +183,48 @@ export async function sendDAInput(
     },
   })
   logger.info({ teamId, messageId: userMsg.messageId, event: 'da_user_message_persisted' })
+
+  runAgentLoop(runtime, text, {
+    ...callbacks,
+    onComplete: async (summary) => {
+      await messageRepo.insertMessage({
+        sessionId: runtime.daSessionId,
+        teamId,
+        role: 'da',
+        content: summary,
+      })
+      logger.info({ teamId, latencyMs: Date.now() - startMs, event: 'da_agent_loop_persisted_summary' })
+      callbacks.onComplete(summary)
+    },
+  }).catch((err) => {
+    logger.error({ teamId, error: err instanceof Error ? err.message : String(err), event: 'da_agent_loop_unhandled_error' })
+  })
+
+  return { messageId: userMsg.messageId }
+}
+
+export async function sendDAInputLegacy(
+  teamId: string,
+  text: string,
+): Promise<{ errors: string[]; messageId: string }> {
+  const startMs = Date.now()
+  const runtime = activeTeams.get(teamId)
+  if (!runtime) {
+    logger.warn({ teamId, event: 'da_input_team_not_running' })
+    throw new Error(`Team ${teamId} is not running`)
+  }
+
+  logger.info({ teamId, textLen: text.length, textPreview: text.slice(0, 80), ccTargets: runtime.ccInstances.map(i => i.name), event: 'da_input_processing_legacy' })
+
+  const userMsg = await messageRepo.insertMessage({
+    sessionId: runtime.daSessionId,
+    teamId,
+    role: 'user',
+    content: text,
+    metadata: {
+      targetCCs: runtime.ccInstances.map((i) => i.name),
+    },
+  })
 
   const errors = handleDAInput(runtime.da, text)
 
@@ -194,7 +240,7 @@ export async function sendDAInput(
     content: confirmText,
   })
 
-  logger.info({ teamId, messageId: userMsg.messageId, ccCount, errorCount: errors.length, errors: errors.length > 0 ? errors : undefined, latencyMs: Date.now() - startMs, event: 'da_input_complete' })
+  logger.info({ teamId, messageId: userMsg.messageId, ccCount, errorCount: errors.length, latencyMs: Date.now() - startMs, event: 'da_input_complete_legacy' })
   return { errors, messageId: userMsg.messageId }
 }
 

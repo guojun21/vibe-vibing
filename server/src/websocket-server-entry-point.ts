@@ -54,7 +54,8 @@ import { shellQuote } from './shell-argument-escaping'
 import { SshTerminalProxy } from './terminal/ssh-remote-terminal-proxy'
 import { connectMongoDB, closeMongoDB } from './database/mongodb-connection'
 import * as teamRepo from './database/team-repository'
-import { startTeam, stopTeam, sendDAInput, getDAHistory, getActiveTeam, getAllActiveTeams } from './team-lifecycle-service'
+import { startTeam, stopTeam, sendDAInput, getDAHistory, getActiveTeam, getAllActiveTeams, abortAgentLoop } from './team-lifecycle-service'
+import type { DAToolCallInfo, DAToolResultInfo } from './shared/shared-message-and-session-types'
 
 function checkPortAvailable(port: number): void {
   let result: ReturnType<typeof Bun.spawnSync>
@@ -2588,21 +2589,113 @@ async function handleTeamStop(message: { teamId: string }, ws: ServerWebSocket<W
   }
 }
 
+let agentLoopStepCounters = new Map<string, number>()
+
 async function handleDAInputMessage(message: { teamId: string; text: string }, ws: ServerWebSocket<WSData>) {
   const startMs = Date.now()
   const reqId = `di_${Date.now()}`
-  logger.info({ reqId, teamId: message.teamId, textLen: message.text.length, textPreview: message.text.slice(0, 100), event: 'da_input_start' })
+  const teamId = message.teamId
+  logger.info({ reqId, teamId, textLen: message.text.length, textPreview: message.text.slice(0, 100), event: 'da_input_start' })
+
+  // Auto-start team if not running yet
+  if (!getActiveTeam(teamId)) {
+    logger.info({ reqId, teamId, event: 'da_input_auto_starting_team' })
+    try {
+      const runtime = await startTeam(
+        teamId,
+        (tid, statuses) => {
+          broadcast({ type: 'cc-status-update', teamId: tid, statuses } as any)
+        },
+        (tid, summary) => {
+          broadcast({ type: 'da-message', teamId: tid, message: { messageId: crypto.randomUUID(), teamId: tid, role: 'da', content: summary, timestamp: new Date().toISOString() } } as any)
+        },
+      )
+      const statuses: Record<string, string> = {}
+      const ccOutputFiles: Record<string, string> = {}
+      for (const inst of runtime.ccInstances) {
+        statuses[inst.name] = inst.status
+        ccOutputFiles[inst.name] = inst.outputFilePath
+      }
+      broadcast({ type: 'team-status', status: { teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles } } as any)
+      logger.info({ reqId, teamId, ccCount: runtime.ccInstances.length, event: 'da_input_auto_start_success' })
+    } catch (startErr) {
+      const errMsg = startErr instanceof Error ? startErr.message : String(startErr)
+      logger.error({ reqId, teamId, error: errMsg, event: 'da_input_auto_start_failed' })
+      send(ws, { type: 'error', message: `Failed to auto-start team: ${errMsg}` })
+      return
+    }
+  }
+
+  agentLoopStepCounters.set(teamId, 0)
+
+  broadcast({
+    type: 'da-message',
+    teamId,
+    message: {
+      messageId: crypto.randomUUID(),
+      teamId,
+      role: 'user',
+      content: message.text,
+      timestamp: new Date().toISOString(),
+    },
+  } as any)
+
   try {
-    const result = await sendDAInput(message.teamId, message.text)
-    const hasErrors = result.errors.length > 0
-    const confirmText = hasErrors
-      ? `发送失败: ${result.errors.join(', ')}`
-      : `已发送到所有 CC`
-    broadcast({ type: 'da-message', teamId: message.teamId, message: { messageId: crypto.randomUUID(), teamId: message.teamId, role: 'da', content: confirmText, timestamp: new Date().toISOString() } } as any)
-    logger.info({ reqId, teamId: message.teamId, messageId: result.messageId, errorCount: result.errors.length, errors: hasErrors ? result.errors : undefined, latencyMs: Date.now() - startMs, event: 'da_input_complete' })
+    const result = await sendDAInput(teamId, message.text, {
+      onThinking: (content) => {
+        const step = agentLoopStepCounters.get(teamId) ?? 0
+        broadcast({ type: 'da-thinking', teamId, content, step } as any)
+      },
+      onToolCall: (toolCalls) => {
+        const step = (agentLoopStepCounters.get(teamId) ?? 0) + 1
+        agentLoopStepCounters.set(teamId, step)
+        const mapped: DAToolCallInfo[] = toolCalls.map(tc => ({
+          id: tc.id,
+          name: tc.function.name,
+          arguments: tc.function.arguments,
+        }))
+        broadcast({ type: 'da-tool-call', teamId, toolCalls: mapped, step } as any)
+      },
+      onToolResult: (results) => {
+        const step = agentLoopStepCounters.get(teamId) ?? 0
+        const mapped: DAToolResultInfo[] = results.map(r => ({
+          id: r.id,
+          name: r.name,
+          output: r.output,
+          isError: r.isError,
+        }))
+        broadcast({ type: 'da-tool-result', teamId, results: mapped, step } as any)
+      },
+      onComplete: (summary) => {
+        agentLoopStepCounters.delete(teamId)
+        broadcast({
+          type: 'da-complete',
+          teamId,
+          summary,
+        } as any)
+        broadcast({
+          type: 'da-message',
+          teamId,
+          message: {
+            messageId: crypto.randomUUID(),
+            teamId,
+            role: 'da',
+            content: summary,
+            timestamp: new Date().toISOString(),
+          },
+        } as any)
+        logger.info({ reqId, teamId, latencyMs: Date.now() - startMs, event: 'da_agent_loop_complete_broadcast' })
+      },
+      onError: (error) => {
+        agentLoopStepCounters.delete(teamId)
+        broadcast({ type: 'da-error', teamId, error } as any)
+        logger.error({ reqId, teamId, error, latencyMs: Date.now() - startMs, event: 'da_agent_loop_error_broadcast' })
+      },
+    })
+    logger.info({ reqId, teamId, messageId: result.messageId, latencyMs: Date.now() - startMs, event: 'da_input_accepted' })
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
-    logger.error({ reqId, teamId: message.teamId, error: errMsg, stack: err instanceof Error ? err.stack : undefined, latencyMs: Date.now() - startMs, event: 'da_input_error' })
+    logger.error({ reqId, teamId, error: errMsg, stack: err instanceof Error ? err.stack : undefined, latencyMs: Date.now() - startMs, event: 'da_input_error' })
     send(ws, { type: 'error', message: errMsg })
   }
 }

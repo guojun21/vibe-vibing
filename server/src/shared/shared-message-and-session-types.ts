@@ -112,6 +112,19 @@ export interface DAMessage {
   timestamp: string
 }
 
+export interface DAToolCallInfo {
+  id: string
+  name: string
+  arguments: string
+}
+
+export interface DAToolResultInfo {
+  id: string
+  name: string
+  output: string
+  isError: boolean
+}
+
 export type ServerMessage =
   | { type: 'sessions'; sessions: Session[] }
   | { type: 'session-update'; session: Session }
@@ -145,6 +158,11 @@ export type ServerMessage =
   | { type: 'da-message'; teamId: string; message: DAMessage }
   | { type: 'da-history'; teamId: string; messages: DAMessage[] }
   | { type: 'cc-status-update'; teamId: string; statuses: Record<string, string> }
+  | { type: 'da-thinking'; teamId: string; content: string; step: number }
+  | { type: 'da-tool-call'; teamId: string; toolCalls: DAToolCallInfo[]; step: number }
+  | { type: 'da-tool-result'; teamId: string; results: DAToolResultInfo[]; step: number }
+  | { type: 'da-complete'; teamId: string; summary: string }
+  | { type: 'da-error'; teamId: string; error: string }
 
 export interface ResumeError {
   code: 'NOT_FOUND' | 'ALREADY_ACTIVE' | 'RESUME_FAILED'
