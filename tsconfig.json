@@ -12,11 +12,12 @@
     "forceConsistentCasingInFileNames": true,
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
-    "types": ["bun-types", "vite/client", "vite-plugin-pwa/client"],
+    "types": ["bun-types"],
     "baseUrl": ".",
     "paths": {
-      "@shared/*": ["src/shared/*"]
+      "@shared/*": ["frontend/src/shared/*"]
     }
   },
-  "include": ["src"]
+  "include": ["frontend/src", "server/src"],
+  "exclude": ["node_modules", "dist"]
 }

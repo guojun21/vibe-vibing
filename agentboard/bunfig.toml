@@ -1,8 +1,0 @@
-[install]
-cache = true
-
-[run]
-silent = true
-
-[test]
-root = "./src"

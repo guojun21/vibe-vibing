@@ -1,0 +1,7 @@
+export { TerminalProxyBase } from './abstract-terminal-proxy-base'
+export { PtyTerminalProxy } from './pty-based-terminal-proxy'
+export { PipePaneTerminalProxy } from './tmux-pipe-pane-terminal-proxy'
+export { SshTerminalProxy } from './ssh-remote-terminal-proxy'
+export { createTerminalProxy, createSshTerminalProxy, resolveTerminalMode } from './terminal-proxy-factory-resolver'
+export { TerminalProxyError, TerminalState } from './terminal-proxy-type-definitions'
+export type { ITerminalProxy, TerminalMode, TerminalProxyOptions } from './terminal-proxy-type-definitions'

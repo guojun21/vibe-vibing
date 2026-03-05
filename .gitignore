@@ -3,20 +3,11 @@ backend/vibe-curlaude
 backend/bin/
 backend/vendor/
 
-# Node/Electron
+# Node/Bun
 node_modules/
 dist/
 *.tsbuildinfo
-frontend/node_modules/
-frontend/dist/
-agentboard/node_modules/
-agentboard/dist/
-agentboard/.pl4n/
-agentboard/.github/
-agentboard/.githooks/
-agentboard/notes/
-agentboard/assets/
-agentboard/bin/
+bun.lock
 
 # Reference projects (cloned for study, not part of this repo)
 reference/
