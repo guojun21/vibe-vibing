@@ -2559,10 +2559,12 @@ async function handleTeamStart(message: { teamId: string }, ws: ServerWebSocket<
       },
     )
     const statuses: Record<string, string> = {}
+    const ccOutputFiles: Record<string, string> = {}
     for (const inst of runtime.ccInstances) {
       statuses[inst.name] = inst.status
+      ccOutputFiles[inst.name] = inst.outputFilePath
     }
-    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId } } as any)
+    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles } } as any)
     logger.info({ reqId, teamId: message.teamId, ccCount: runtime.ccInstances.length, daSessionId: runtime.daSessionId, ccStatuses: statuses, latencyMs: Date.now() - startMs, event: 'team_start_success' })
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)

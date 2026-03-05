@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto'
+import { mkdirSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { detectCCStatus, isIdleStatus, type CCStatus } from './cc-status-detector'
 import { logger } from './structured-pino-logger'
+
+const CC_OUTPUT_DIR = join(process.env.HOME || '/tmp', '.vibe-vibing', 'cc-outputs')
 
 function runTmux(args: string[]): string {
   const result = Bun.spawnSync(['tmux', ...args])
@@ -54,9 +58,14 @@ export interface CCInstance {
   contentHash: string
   agentType: string
   memberIndex: number
+  outputFilePath: string
 }
 
 export function createCCInstance(name: string, tmuxSessionName: string, agentType: string, memberIndex: number): CCInstance {
+  if (!existsSync(CC_OUTPUT_DIR)) {
+    mkdirSync(CC_OUTPUT_DIR, { recursive: true })
+  }
+  const outputFilePath = join(CC_OUTPUT_DIR, `${tmuxSessionName}.txt`)
   return {
     name,
     tmuxSessionName,
@@ -65,7 +74,13 @@ export function createCCInstance(name: string, tmuxSessionName: string, agentTyp
     contentHash: '',
     agentType,
     memberIndex,
+    outputFilePath,
   }
+}
+
+function attachPipePane(session: string, outputFile: string): void {
+  Bun.spawnSync(['bash', '-c', `> "${outputFile}"`])
+  runTmux(['pipe-pane', '-t', session, `-o`, `cat >> "${outputFile}"`])
 }
 
 export async function startCCInstance(instance: CCInstance, workDir: string, command = 'claude'): Promise<void> {
@@ -74,7 +89,15 @@ export async function startCCInstance(instance: CCInstance, workDir: string, com
     killTmuxSession(instance.tmuxSessionName)
   }
   createTmuxSession(instance.tmuxSessionName, workDir, command)
-  logger.info({ name: instance.name, session: instance.tmuxSessionName }, 'CC instance started')
+
+  try {
+    attachPipePane(instance.tmuxSessionName, instance.outputFilePath)
+    logger.info({ name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath, event: 'cc_pipe_pane_attached' })
+  } catch (err) {
+    logger.warn({ name: instance.name, error: err instanceof Error ? err.message : String(err), event: 'cc_pipe_pane_attach_failed' })
+  }
+
+  logger.info({ name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath, event: 'cc_instance_started' })
 }
 
 export async function waitCCReady(instance: CCInstance, timeoutMs = 60000): Promise<void> {
@@ -112,12 +135,13 @@ export function refreshCCInstance(instance: CCInstance): void {
 }
 
 export function stopCCInstance(instance: CCInstance): void {
+  try { runTmux(['pipe-pane', '-t', instance.tmuxSessionName]) } catch {}
   killTmuxSession(instance.tmuxSessionName)
-  logger.info({ name: instance.name, session: instance.tmuxSessionName }, 'CC instance stopped')
+  logger.info({ name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath, event: 'cc_instance_stopped' })
 }
 
 export function sendInputToCCInstance(instance: CCInstance, text: string): void {
   sendKeys(instance.tmuxSessionName, text)
 }
 
-export { ensureTmuxServer, tmuxSessionExists, killTmuxSession, sendKeys, sendSpecialKey, capturePaneContent }
+export { ensureTmuxServer, tmuxSessionExists, killTmuxSession, sendKeys, sendSpecialKey, capturePaneContent, CC_OUTPUT_DIR }
