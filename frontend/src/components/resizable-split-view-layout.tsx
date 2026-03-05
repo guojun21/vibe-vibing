@@ -111,20 +111,20 @@ export default function SplitView({ pinnedSessions }: Props) {
   const rightPct = `${(1 - hFrac) * 100}%`
 
   return (
-    <div ref={containerRef} className="flex h-full w-full overflow-hidden">
+    <div ref={containerRef} className="flex h-full w-full min-h-0 overflow-hidden">
       {/* Left: DA Panel */}
-      <div style={{ width: leftPct, minWidth: 200 }} className="shrink-0 h-full overflow-hidden">
+      <div style={{ width: leftPct, minWidth: 200 }} className="shrink-0 h-full min-h-0 overflow-hidden">
         <DAPanel onSendToAll={handleSendToAll} />
       </div>
 
       <HorizontalHandle onMouseDown={hDrag} />
 
       {/* Right: CC Terminals stacked */}
-      <div style={{ width: rightPct }} className="flex flex-col h-full min-w-0 overflow-hidden gap-0">
+      <div style={{ width: rightPct }} className="flex flex-col h-full min-h-0 min-w-0 overflow-hidden gap-0">
         {pinnedSessions.map((session, i) => (
           <Fragment key={session.id}>
             {i > 0 && <div className="h-1 shrink-0 bg-white/5" />}
-            <div className="flex-1 min-h-[100px] overflow-hidden">
+            <div className="flex-1 min-h-0 overflow-hidden">
               <TerminalInstance ref={setTermRef(session.id)} session={session} />
             </div>
           </Fragment>

@@ -613,7 +613,7 @@ export default function App() {
 
       {/* Main content: SplitView or single Terminal */}
       {splitViewEnabled && pinnedSessions.length > 0 ? (
-        <div className="flex-1 min-w-0 h-full p-1">
+        <div className="flex-1 min-w-0 min-h-0 h-full overflow-hidden p-1">
           <SplitView pinnedSessions={pinnedSessions} />
         </div>
       ) : (
