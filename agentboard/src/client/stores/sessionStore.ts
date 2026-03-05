@@ -1,0 +1,209 @@
+import { create } from 'zustand'
+import { persist, createJSONStorage } from 'zustand/middleware'
+import type { AgentSession, HostStatus, Session } from '@shared/types'
+import { sortSessions } from '../utils/sessions'
+import { useSettingsStore } from './settingsStore'
+import { createTabStorage } from '../utils/storage'
+
+const SESSION_PERSIST_KEY = 'agentboard-session'
+const tabStorage = createTabStorage(SESSION_PERSIST_KEY)
+
+function sessionsEqualById(a: Session, b: Session): boolean {
+  return (
+    a.id === b.id &&
+    a.name === b.name &&
+    a.tmuxWindow === b.tmuxWindow &&
+    a.projectPath === b.projectPath &&
+    a.status === b.status &&
+    a.lastActivity === b.lastActivity &&
+    a.createdAt === b.createdAt &&
+    a.source === b.source &&
+    a.host === b.host &&
+    a.remote === b.remote &&
+    a.command === b.command &&
+    a.agentType === b.agentType &&
+    a.agentSessionId === b.agentSessionId &&
+    a.agentSessionName === b.agentSessionName &&
+    a.logFilePath === b.logFilePath &&
+    a.isPinned === b.isPinned &&
+    a.lastUserMessage === b.lastUserMessage
+  )
+}
+
+/** Compare two session arrays for structural equality, ignoring order. */
+function sessionsEqual(a: Session[], b: Session[]): boolean {
+  if (a.length !== b.length) return false
+  const byId = new Map(a.map((session) => [session.id, session]))
+  for (const next of b) {
+    const current = byId.get(next.id)
+    if (!current || !sessionsEqualById(current, next)) {
+      return false
+    }
+  }
+  return true
+}
+
+export type ConnectionStatus =
+  | 'connecting'
+  | 'connected'
+  | 'reconnecting'
+  | 'disconnected'
+
+interface SessionState {
+  sessions: Session[]
+  agentSessions: { active: AgentSession[]; inactive: AgentSession[] }
+  hostStatuses: HostStatus[]
+  // Sessions being animated out - keyed by session ID, value is the session data
+  exitingSessions: Map<string, Session>
+  selectedSessionId: string | null
+  pinnedSessionIds: string[]
+  splitViewEnabled: boolean
+  hasLoaded: boolean
+  connectionStatus: ConnectionStatus
+  connectionError: string | null
+  setSessions: (sessions: Session[]) => void
+  setAgentSessions: (active: AgentSession[], inactive: AgentSession[]) => void
+  setHostStatuses: (hosts: HostStatus[]) => void
+  updateSession: (session: Session) => void
+  setSelectedSessionId: (sessionId: string | null) => void
+  setPinnedSessionIds: (ids: string[]) => void
+  pinSession: (id: string) => void
+  unpinSession: (id: string) => void
+  toggleSplitView: () => void
+  setConnectionStatus: (status: ConnectionStatus) => void
+  setConnectionError: (error: string | null) => void
+  remoteAllowControl: boolean
+  setRemoteAllowControl: (value: boolean) => void
+  remoteAllowAttach: boolean
+  setRemoteAllowAttach: (value: boolean) => void
+  hostLabel: string | null
+  setHostLabel: (value: string | null) => void
+  // Mark a session as exiting (preserves data for exit animation)
+  markSessionExiting: (sessionId: string) => void
+  // Clear a session from exiting state (after animation completes)
+  clearExitingSession: (sessionId: string) => void
+}
+
+export const useSessionStore = create<SessionState>()(
+  persist(
+    (set, get) => ({
+      sessions: [],
+      agentSessions: { active: [], inactive: [] },
+      hostStatuses: [],
+      exitingSessions: new Map(),
+      selectedSessionId: null,
+      pinnedSessionIds: [],
+      splitViewEnabled: true,
+      hasLoaded: false,
+      connectionStatus: 'connecting',
+      connectionError: null,
+      remoteAllowControl: false,
+      remoteAllowAttach: false,
+      hostLabel: null,
+      setSessions: (sessions) => {
+        const state = get()
+        const selected = state.selectedSessionId
+        const currentSessions = state.sessions
+        const exitingSessions = state.exitingSessions
+
+        // Skip redundant snapshots to avoid unnecessary re-renders/animation churn.
+        // Keep activity timestamps in equality so status sorting and badges stay fresh.
+        if (state.hasLoaded && sessionsEqual(currentSessions, sessions)) {
+          return
+        }
+
+        // Detect sessions removed by external sources (other tabs, devices, tmux).
+        // Mark them as exiting so SessionList can animate them out gracefully.
+        // Without this, externally-killed sessions vanish instantly causing artifacts.
+        const newSessionIds = new Set(sessions.map((s) => s.id))
+        const removedSessions = currentSessions.filter(
+          (s) => !newSessionIds.has(s.id) && !exitingSessions.has(s.id)
+        )
+
+        let newSelectedId: string | null = selected
+        if (
+          selected !== null &&
+          !sessions.some((session) => session.id === selected)
+        ) {
+          // Auto-select first session (by sort order) when current one is deleted
+          const { sessionSortMode, sessionSortDirection } =
+            useSettingsStore.getState()
+          const sorted = sortSessions(sessions, {
+            mode: sessionSortMode,
+            direction: sessionSortDirection,
+          })
+          newSelectedId = sorted[0]?.id ?? null
+        }
+
+        // Only update exitingSessions if there are newly removed sessions
+        if (removedSessions.length > 0) {
+          const nextExitingSessions = new Map(exitingSessions)
+          for (const session of removedSessions) {
+            nextExitingSessions.set(session.id, session)
+          }
+          set({
+            sessions,
+            hasLoaded: true,
+            selectedSessionId: newSelectedId,
+            exitingSessions: nextExitingSessions,
+          })
+        } else {
+          set({
+            sessions,
+            hasLoaded: true,
+            selectedSessionId: newSelectedId,
+          })
+        }
+      },
+      setAgentSessions: (active, inactive) =>
+        set({
+          agentSessions: { active, inactive },
+        }),
+      setHostStatuses: (hosts) => set({ hostStatuses: hosts }),
+      updateSession: (session) =>
+        set((state) => ({
+          sessions: state.sessions.map((existing) =>
+            existing.id === session.id ? session : existing
+          ),
+        })),
+      setSelectedSessionId: (sessionId) => set({ selectedSessionId: sessionId }),
+      setPinnedSessionIds: (ids) => set({ pinnedSessionIds: ids }),
+      pinSession: (id) => set((state) => ({
+        pinnedSessionIds: state.pinnedSessionIds.includes(id)
+          ? state.pinnedSessionIds
+          : [...state.pinnedSessionIds, id],
+      })),
+      unpinSession: (id) => set((state) => ({
+        pinnedSessionIds: state.pinnedSessionIds.filter((sid) => sid !== id),
+      })),
+      toggleSplitView: () => set((state) => ({ splitViewEnabled: !state.splitViewEnabled })),
+      setConnectionStatus: (status) => set({ connectionStatus: status }),
+      setConnectionError: (error) => set({ connectionError: error }),
+      setRemoteAllowControl: (value) => set({ remoteAllowControl: value }),
+      setRemoteAllowAttach: (value) => set({ remoteAllowAttach: value }),
+      setHostLabel: (value) => set({ hostLabel: value }),
+      markSessionExiting: (sessionId) => {
+        const session = get().sessions.find((s) => s.id === sessionId)
+        if (session) {
+          const next = new Map(get().exitingSessions)
+          next.set(sessionId, session)
+          set({ exitingSessions: next })
+        }
+      },
+      clearExitingSession: (sessionId) => {
+        const next = new Map(get().exitingSessions)
+        next.delete(sessionId)
+        set({ exitingSessions: next })
+      },
+    }),
+    {
+      name: SESSION_PERSIST_KEY,
+      storage: createJSONStorage(() => tabStorage),
+      partialize: (state) => ({
+        selectedSessionId: state.selectedSessionId,
+        pinnedSessionIds: state.pinnedSessionIds,
+        splitViewEnabled: state.splitViewEnabled,
+      }),
+    }
+  )
+)

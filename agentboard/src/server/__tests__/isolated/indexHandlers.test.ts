@@ -1,0 +1,2712 @@
+import { afterAll, afterEach, beforeEach, describe, expect, test, mock } from 'bun:test'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import type { Session, ServerMessage } from '@shared/types'
+import type { AgentSessionRecord } from '../../db'
+
+const bunAny = Bun as typeof Bun & {
+  serve: typeof Bun.serve
+  spawn: typeof Bun.spawn
+  spawnSync: typeof Bun.spawnSync
+  write: typeof Bun.write
+}
+
+const processAny = process as typeof process & {
+  on: typeof process.on
+  exit: typeof process.exit
+}
+
+const originalServe = bunAny.serve
+const originalSpawn = bunAny.spawn
+const originalSpawnSync = bunAny.spawnSync
+const originalWrite = bunAny.write
+const originalSetInterval = globalThis.setInterval
+const originalConsoleLog = console.log
+const originalConsoleError = console.error
+const originalProcessOn = processAny.on
+const originalProcessExit = processAny.exit
+
+let serveOptions: Parameters<typeof Bun.serve>[0] | null = null
+let spawnSyncImpl: typeof Bun.spawnSync
+let writeImpl: typeof Bun.write
+let replaceSessionsCalls: Session[][] = []
+let dbState: {
+  records: Map<string, AgentSessionRecord>
+  nextId: number
+  updateCalls: Array<{ sessionId: string; patch: Partial<AgentSessionRecord> }>
+  setPinnedCalls: Array<{ sessionId: string; isPinned: boolean }>
+}
+
+const defaultConfig = {
+  port: 4040,
+  hostname: '0.0.0.0',
+  hostLabel: 'test-host',
+  refreshIntervalMs: 1000,
+  tmuxSession: 'agentboard',
+  discoverPrefixes: [],
+  pruneWsSessions: true,
+  terminalMode: 'pty',
+  terminalMonitorTargets: true,
+  tlsCert: '',
+  tlsKey: '',
+  rgThreads: 1,
+  logMatchWorker: false,
+  logMatchProfile: false,
+  claudeResumeCmd: 'claude --resume {sessionId}',
+  codexResumeCmd: 'codex resume {sessionId}',
+  remoteHosts: [] as string[],
+  remotePollMs: 15000,
+  remoteTimeoutMs: 4000,
+  remoteStaleMs: 45000,
+  remoteSshOpts: '',
+  remoteAllowControl: false,
+  remoteAllowAttach: false,
+}
+
+const configState = { ...defaultConfig }
+const baseRecordTimestamp = new Date('2026-01-01T00:00:00.000Z').toISOString()
+
+function resetDbState() {
+  dbState = {
+    records: new Map(),
+    nextId: 1,
+    updateCalls: [],
+    setPinnedCalls: [],
+  }
+}
+
+function makeRecord(overrides: Partial<AgentSessionRecord> = {}): AgentSessionRecord {
+  const id = overrides.id ?? dbState.nextId++
+  const sessionId = overrides.sessionId ?? `session-${id}`
+  const logFilePath =
+    overrides.logFilePath ?? path.join('/tmp', `${sessionId}.jsonl`)
+
+  return {
+    id,
+    sessionId,
+    logFilePath,
+    projectPath: '/tmp/project',
+    slug: null,
+    agentType: 'claude',
+    displayName: 'alpha',
+    createdAt: baseRecordTimestamp,
+    lastActivityAt: baseRecordTimestamp,
+    lastUserMessage: null,
+    currentWindow: null,
+    isPinned: false,
+    lastResumeError: null,
+    lastKnownLogSize: null,
+    isCodexExec: false,
+    ...overrides,
+  }
+}
+
+function seedRecord(record: AgentSessionRecord) {
+  dbState.records.set(record.sessionId, record)
+}
+
+let sessionManagerState: {
+  listWindows: () => Session[]
+  createWindow: (
+    projectPath: string,
+    name?: string,
+    command?: string
+  ) => Session
+  killWindow: (tmuxWindow: string) => void
+  renameWindow: (tmuxWindow: string, newName: string) => void
+}
+
+class SessionManagerMock {
+  static instance: SessionManagerMock | null = null
+  constructor() {
+    SessionManagerMock.instance = this
+  }
+
+  listWindows() {
+    return sessionManagerState.listWindows()
+  }
+
+  createWindow(projectPath: string, name?: string, command?: string) {
+    return sessionManagerState.createWindow(projectPath, name, command)
+  }
+
+  killWindow(tmuxWindow: string) {
+    sessionManagerState.killWindow(tmuxWindow)
+  }
+
+  renameWindow(tmuxWindow: string, newName: string) {
+    sessionManagerState.renameWindow(tmuxWindow, newName)
+  }
+}
+
+class SessionRegistryMock {
+  static instance: SessionRegistryMock | null = null
+  sessions: Session[] = []
+  agentSessions: { active: unknown[]; inactive: unknown[] } = {
+    active: [],
+    inactive: [],
+  }
+  listeners = new Map<string, Array<(payload: unknown) => void>>()
+
+  constructor() {
+    SessionRegistryMock.instance = this
+  }
+
+  replaceSessions(sessions: Session[]) {
+    this.sessions = sessions
+    replaceSessionsCalls.push(sessions)
+    this.emit('sessions', sessions)
+  }
+
+  getAll() {
+    return this.sessions
+  }
+
+  getAgentSessions() {
+    return this.agentSessions
+  }
+
+  get(id: string) {
+    return this.sessions.find((session) => session.id === id)
+  }
+
+  updateSession(id: string, patch: Partial<Session>) {
+    const index = this.sessions.findIndex((session) => session.id === id)
+    if (index === -1) return undefined
+    const updated = { ...this.sessions[index], ...patch }
+    this.sessions[index] = updated
+    this.emit('session-update', updated)
+    return updated
+  }
+
+  on(event: string, listener: (payload: unknown) => void) {
+    const list = this.listeners.get(event) ?? []
+    list.push(listener)
+    this.listeners.set(event, list)
+  }
+
+  emit(event: string, payload: unknown) {
+    for (const listener of this.listeners.get(event) ?? []) {
+      listener(payload)
+    }
+  }
+
+  setAgentSessions(active: unknown[], inactive: unknown[]) {
+    this.agentSessions = { active, inactive }
+    this.emit('agent-sessions', { active, inactive })
+  }
+}
+
+class TerminalProxyMock {
+  static instances: TerminalProxyMock[] = []
+  options: {
+    connectionId: string
+    sessionName: string
+    baseSession: string
+    onData: (data: string) => void
+    onExit?: () => void
+  }
+  starts = 0
+  writes: string[] = []
+  resizes: Array<{ cols: number; rows: number }> = []
+  disposed = false
+  switchTargets: string[] = []
+  private started = false
+
+  constructor(options: {
+    connectionId: string
+    sessionName: string
+    baseSession: string
+    onData: (data: string) => void
+    onExit?: () => void
+  }) {
+    this.options = options
+    TerminalProxyMock.instances.push(this)
+  }
+
+  start() {
+    if (!this.started) {
+      this.starts += 1
+      this.started = true
+    }
+    return Promise.resolve()
+  }
+
+  switchTo(target: string, onReady?: () => void) {
+    this.switchTargets.push(target)
+    if (onReady) {
+      onReady()
+    }
+    return Promise.resolve(true)
+  }
+
+  resolveEffectiveTarget(target: string) {
+    if (target === this.options.baseSession) {
+      return this.options.sessionName
+    }
+    const prefix = `${this.options.baseSession}:`
+    if (target.startsWith(prefix)) {
+      return `${this.options.sessionName}:${target.slice(prefix.length)}`
+    }
+    return target
+  }
+
+  write(data: string) {
+    this.writes.push(data)
+  }
+
+  resize(cols: number, rows: number) {
+    this.resizes.push({ cols, rows })
+  }
+
+  dispose() {
+    this.disposed = true
+  }
+
+  getMode() {
+    return 'pty' as const
+  }
+
+  getSessionName() {
+    return this.options.sessionName
+  }
+
+  emitData(data: string) {
+    this.options.onData(data)
+  }
+
+  emitExit() {
+    this.options.onExit?.()
+  }
+}
+
+mock.module('../../config', () => ({
+  config: configState,
+  isValidHostname: (hostname: string) => {
+    const re = /^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])(\.([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]))*$/
+    return hostname.length > 0 && hostname.length <= 253 && re.test(hostname)
+  },
+}))
+mock.module('../../db', () => ({
+  initDatabase: () => ({
+    getSessionById: (sessionId: string) => dbState.records.get(sessionId) ?? null,
+    getSessionByLogPath: (logFilePath: string) =>
+      Array.from(dbState.records.values()).find(
+        (record) => record.logFilePath === logFilePath
+      ) ?? null,
+    getSessionByWindow: (tmuxWindow: string) =>
+      Array.from(dbState.records.values()).find(
+        (record) => record.currentWindow === tmuxWindow
+      ) ?? null,
+    getActiveSessions: () =>
+      Array.from(dbState.records.values()).filter(
+        (record) => record.currentWindow !== null
+      ),
+    getInactiveSessions: (options?: { maxAgeHours?: number }) => {
+      const inactive = Array.from(dbState.records.values()).filter(
+        (record) => record.currentWindow === null
+      )
+      if (!options?.maxAgeHours) {
+        return inactive
+      }
+      const cutoff = Date.now() - options.maxAgeHours * 60 * 60 * 1000
+      return inactive.filter(
+        (record) => new Date(record.lastActivityAt).getTime() > cutoff
+      )
+    },
+    orphanSession: (sessionId: string) => {
+      const record = dbState.records.get(sessionId)
+      if (!record) return null
+      const updated = { ...record, currentWindow: null }
+      dbState.records.set(sessionId, updated)
+      return updated
+    },
+    updateSession: (
+      sessionId: string,
+      patch: Partial<Omit<AgentSessionRecord, 'id' | 'sessionId'>>
+    ) => {
+      const record = dbState.records.get(sessionId)
+      if (!record) return null
+      const updated = { ...record, ...patch }
+      dbState.records.set(sessionId, updated)
+      dbState.updateCalls.push({
+        sessionId,
+        patch: patch as Partial<AgentSessionRecord>,
+      })
+      return updated
+    },
+    displayNameExists: (displayName: string, excludeSessionId?: string) =>
+      Array.from(dbState.records.values()).some(
+        (record) =>
+          record.displayName === displayName &&
+          record.sessionId !== excludeSessionId
+      ),
+    setPinned: (sessionId: string, isPinned: boolean) => {
+      dbState.setPinnedCalls.push({ sessionId, isPinned })
+      const record = dbState.records.get(sessionId)
+      if (!record) return null
+      const updated = { ...record, isPinned }
+      dbState.records.set(sessionId, updated)
+      return updated
+    },
+    getPinnedOrphaned: () =>
+      Array.from(dbState.records.values()).filter(
+        (record) => record.isPinned && record.currentWindow === null
+      ),
+    getAppSetting: () => null,
+    setAppSetting: () => {},
+    close: () => {},
+  }),
+}))
+mock.module('../../SessionManager', () => ({
+  SessionManager: SessionManagerMock,
+}))
+mock.module('../../SessionRegistry', () => ({
+  SessionRegistry: SessionRegistryMock,
+}))
+class TerminalProxyErrorMock extends Error {
+  code: string
+  retryable: boolean
+  constructor(message: string, code: string, retryable = false) {
+    super(message)
+    this.code = code
+    this.retryable = retryable
+  }
+}
+
+mock.module('../../terminal', () => ({
+  createTerminalProxy: (options: ConstructorParameters<typeof TerminalProxyMock>[0]) =>
+    new TerminalProxyMock(options),
+  resolveTerminalMode: () => 'pty',
+  TerminalProxyError: TerminalProxyErrorMock,
+}))
+
+const baseSession: Session = {
+  id: 'session-1',
+  name: 'alpha',
+  tmuxWindow: 'agentboard:1',
+  projectPath: '/tmp/alpha',
+  status: 'working',
+  lastActivity: new Date().toISOString(),
+  createdAt: new Date().toISOString(),
+  source: 'managed',
+  host: 'test-host',
+  remote: false,
+}
+
+function createWs() {
+  const sent: ServerMessage[] = []
+  const ws = {
+    data: {
+      terminal: null as TerminalProxyMock | null,
+      currentSessionId: null as string | null,
+      currentTmuxTarget: null as string | null,
+      connectionId: 'ws-test',
+      terminalHost: null as string | null,
+      terminalAttachSeq: 0,
+    },
+    send: (payload: string) => {
+      sent.push(JSON.parse(payload) as ServerMessage)
+    },
+  }
+  return { ws, sent }
+}
+
+let importCounter = 0
+
+async function loadIndex() {
+  importCounter += 1
+  await import(`../../index?test=${importCounter}`)
+  if (!serveOptions) {
+    throw new Error('Bun.serve was not called')
+  }
+  if (!SessionRegistryMock.instance) {
+    throw new Error('SessionRegistry instance was not created')
+  }
+  if (!SessionManagerMock.instance) {
+    throw new Error('SessionManager instance was not created')
+  }
+  return {
+    serveOptions,
+    registryInstance: SessionRegistryMock.instance,
+    sessionManagerInstance: SessionManagerMock.instance,
+  }
+}
+
+beforeEach(() => {
+  serveOptions = null
+  replaceSessionsCalls = []
+  TerminalProxyMock.instances = []
+  SessionManagerMock.instance = null
+  SessionRegistryMock.instance = null
+  resetDbState()
+  Object.assign(configState, defaultConfig)
+  sessionManagerState = {
+    listWindows: () => [],
+    createWindow: () => ({ ...baseSession, id: 'created' }),
+    killWindow: () => {},
+    renameWindow: () => {},
+  }
+
+  spawnSyncImpl = () =>
+    ({
+      exitCode: 0,
+      stdout: Buffer.from(''),
+      stderr: Buffer.from(''),
+    }) as ReturnType<typeof Bun.spawnSync>
+  writeImpl = (async () => 0) as typeof Bun.write
+
+  bunAny.spawnSync = ((...args: Parameters<typeof Bun.spawnSync>) =>
+    spawnSyncImpl(...args)) as typeof Bun.spawnSync
+  // Mock Bun.spawn for async SSH calls — delegates to spawnSyncImpl for results
+  bunAny.spawn = ((...args: Parameters<typeof Bun.spawn>) => {
+    const cmd = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+    const opts = typeof args[1] === 'object' ? args[1] : undefined
+    const syncResult = spawnSyncImpl(
+      cmd as Parameters<typeof Bun.spawnSync>[0],
+      opts as Parameters<typeof Bun.spawnSync>[1]
+    )
+    const stdoutBuf = syncResult.stdout ?? Buffer.from('')
+    const stderrBuf = syncResult.stderr ?? Buffer.from('')
+    return {
+      exited: Promise.resolve(syncResult.exitCode ?? 0),
+      stdout: new ReadableStream({
+        start(controller) {
+          controller.enqueue(typeof stdoutBuf === 'string' ? new TextEncoder().encode(stdoutBuf) : stdoutBuf)
+          controller.close()
+        },
+      }),
+      stderr: new ReadableStream({
+        start(controller) {
+          controller.enqueue(typeof stderrBuf === 'string' ? new TextEncoder().encode(stderrBuf) : stderrBuf)
+          controller.close()
+        },
+      }),
+      kill: () => {},
+      pid: 12345,
+    } as unknown as ReturnType<typeof Bun.spawn>
+  }) as typeof Bun.spawn
+  bunAny.serve = ((options: Parameters<typeof Bun.serve>[0]) => {
+    serveOptions = options
+    return {} as ReturnType<typeof Bun.serve>
+  }) as typeof Bun.serve
+  bunAny.write = ((...args: Parameters<typeof Bun.write>) =>
+    writeImpl(...args)) as typeof Bun.write
+
+  globalThis.setInterval = ((..._args: Parameters<typeof globalThis.setInterval>) =>
+    0) as unknown as typeof globalThis.setInterval
+  console.log = () => {}
+  console.error = () => {}
+  processAny.on = (() => processAny) as typeof processAny.on
+})
+
+afterEach(() => {
+  bunAny.serve = originalServe
+  bunAny.spawn = originalSpawn
+  bunAny.spawnSync = originalSpawnSync
+  bunAny.write = originalWrite
+  globalThis.setInterval = originalSetInterval
+  console.log = originalConsoleLog
+  console.error = originalConsoleError
+  processAny.on = originalProcessOn
+  processAny.exit = originalProcessExit
+})
+
+afterAll(() => {
+  mock.restore()
+})
+
+describe('server message handlers', () => {
+  test('websocket open sends sessions and registry broadcasts', async () => {
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [baseSession]
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+    websocket.open?.(ws as never)
+
+    expect(sent.find((message) => message.type === 'sessions')).toEqual({
+      type: 'sessions',
+      sessions: [baseSession],
+    })
+    expect(sent.find((message) => message.type === 'host-status')).toBeTruthy()
+    expect(sent.find((message) => message.type === 'agent-sessions')).toMatchObject({
+      type: 'agent-sessions',
+    })
+
+    const nextSession = { ...baseSession, id: 'session-2', name: 'beta' }
+    registryInstance.emit('session-update', nextSession)
+    registryInstance.emit('sessions', [baseSession, nextSession])
+
+    const sessionUpdate = sent.find(
+      (message) => message.type === 'session-update'
+    )
+    expect(sessionUpdate).toEqual({ type: 'session-update', session: nextSession })
+
+    const sessionMessages = sent.filter((message) => message.type === 'sessions')
+    expect(sessionMessages[1]).toEqual({
+      type: 'sessions',
+      sessions: [baseSession, nextSession],
+    })
+  })
+
+  test('handles invalid payloads and unknown types', async () => {
+    const { serveOptions } = await loadIndex()
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    websocket.message?.(ws as never, 'not-json')
+    websocket.message?.(ws as never, JSON.stringify({ type: 'unknown' }))
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'terminal-attach', sessionId: 'missing' })
+    )
+
+    expect(sent[0]).toEqual({
+      type: 'error',
+      message: 'Invalid message payload',
+    })
+    expect(sent[1]).toEqual({ type: 'error', message: 'Unknown message type' })
+    expect(sent[2]).toEqual({
+      type: 'terminal-error',
+      sessionId: 'missing',
+      code: 'ERR_INVALID_WINDOW',
+      message: 'Session not found',
+      retryable: false,
+    })
+  })
+
+  test('refreshes sessions and creates new sessions', async () => {
+    const createdSession = { ...baseSession, id: 'created', name: 'new' }
+    let listCalls = 0
+    sessionManagerState.listWindows = () => {
+      listCalls += 1
+      return [createdSession]
+    }
+    sessionManagerState.createWindow = () => createdSession
+
+    const { serveOptions } = await loadIndex()
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    const refreshPayload = Buffer.from(
+      JSON.stringify({ type: 'session-refresh' })
+    )
+    websocket.message?.(ws as never, refreshPayload)
+
+    // 2 calls: startup logging + initial sync refresh
+    // (message refresh uses async worker, not sessionManager.listWindows)
+    expect(listCalls).toBe(2)
+    expect(replaceSessionsCalls).toHaveLength(1)
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/tmp/new',
+        name: 'new',
+        command: 'claude',
+      })
+    )
+
+    expect(sent.some((message) => message.type === 'session-created')).toBe(true)
+
+    sessionManagerState.createWindow = () => {
+      throw new Error('explode')
+    }
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/tmp/new',
+      })
+    )
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'explode',
+    })
+  })
+
+  test('returns errors for kill and rename when sessions are missing', async () => {
+    const externalSession = {
+      ...baseSession,
+      id: 'external',
+      source: 'external' as const,
+      tmuxWindow: 'work:1',
+    }
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [externalSession]
+
+    const killed: string[] = []
+    sessionManagerState.killWindow = (tmuxWindow: string) => {
+      killed.push(tmuxWindow)
+    }
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-kill', sessionId: 'missing' })
+    )
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-kill', sessionId: 'external' })
+    )
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-rename',
+        sessionId: 'missing',
+        newName: 'rename',
+      })
+    )
+
+    expect(sent[0]).toEqual({ type: 'kill-failed', sessionId: 'missing', message: 'Session not found' })
+    // External sessions cannot be killed by default (requires ALLOW_KILL_EXTERNAL=true)
+    expect(sent[1]).toEqual({ type: 'kill-failed', sessionId: 'external', message: 'Cannot kill external sessions' })
+    expect(killed).toEqual([])
+    expect(sent[2]).toEqual({ type: 'error', message: 'Session not found' })
+  })
+
+  test('handles kill and rename success paths', async () => {
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [baseSession]
+
+    const killed: string[] = []
+    const renamed: Array<{ tmuxWindow: string; name: string }> = []
+    sessionManagerState.killWindow = (tmuxWindow: string) => {
+      killed.push(tmuxWindow)
+    }
+    sessionManagerState.renameWindow = (tmuxWindow: string, newName: string) => {
+      renamed.push({ tmuxWindow, name: newName })
+    }
+    sessionManagerState.listWindows = () => [baseSession]
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-kill', sessionId: baseSession.id })
+    )
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-rename',
+        sessionId: baseSession.id,
+        newName: 'renamed',
+      })
+    )
+
+    expect(killed).toEqual([baseSession.tmuxWindow])
+    expect(renamed).toEqual([
+      { tmuxWindow: baseSession.tmuxWindow, name: 'renamed' },
+    ])
+
+    sessionManagerState.killWindow = () => {
+      throw new Error('boom')
+    }
+    sessionManagerState.renameWindow = () => {
+      throw new Error('nope')
+    }
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-kill', sessionId: baseSession.id })
+    )
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-rename',
+        sessionId: baseSession.id,
+        newName: 'later',
+      })
+    )
+
+    expect(sent[sent.length - 2]).toEqual({ type: 'kill-failed', sessionId: baseSession.id, message: 'boom' })
+    expect(sent[sent.length - 1]).toEqual({ type: 'error', message: 'nope' })
+  })
+
+  test('blocks remote kill when remoteAllowControl is false', async () => {
+    const remoteSession: Session = {
+      ...baseSession,
+      id: 'remote-1',
+      remote: true,
+      host: 'remote-host',
+      tmuxWindow: 'remote:1',
+    }
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [remoteSession]
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-kill', sessionId: 'remote-1' })
+    )
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'kill-failed',
+      sessionId: 'remote-1',
+      message: 'Remote sessions are read-only',
+    })
+  })
+
+  test('kills remote session via SSH when remoteAllowControl is true', async () => {
+    configState.remoteAllowControl = true
+    const remoteSession: Session = {
+      ...baseSession,
+      id: 'remote-1',
+      remote: true,
+      host: 'remote-host',
+      tmuxWindow: 'remote:1',
+    }
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [remoteSession]
+    sessionManagerState.listWindows = () => []
+
+    const sshCalls: string[][] = []
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      sshCalls.push(command as string[])
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-kill', sessionId: 'remote-1' })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    const sshKillCall = sshCalls.find(
+      (cmd) => cmd[0] === 'ssh' && cmd.some((a) => a.includes('kill-window'))
+    )
+    expect(sshKillCall).toBeTruthy()
+    expect(sshKillCall).toContain('remote-host')
+    // Session should be removed from registry
+    expect(registryInstance.sessions.find((s) => s.id === 'remote-1')).toBeUndefined()
+    // Should not send kill-failed
+    expect(sent.find((m) => m.type === 'kill-failed')).toBeUndefined()
+  })
+
+  test('sends kill-failed when remote SSH kill fails', async () => {
+    configState.remoteAllowControl = true
+    const remoteSession: Session = {
+      ...baseSession,
+      id: 'remote-1',
+      remote: true,
+      host: 'remote-host',
+      tmuxWindow: 'remote:1',
+    }
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [remoteSession]
+
+    spawnSyncImpl = ((..._args: Parameters<typeof Bun.spawnSync>) => ({
+      exitCode: 1,
+      stdout: Buffer.from(''),
+      stderr: Buffer.from('window not found'),
+    })) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-kill', sessionId: 'remote-1' })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'kill-failed',
+      sessionId: 'remote-1',
+      message: 'window not found',
+    })
+  })
+
+  test('blocks remote rename when remoteAllowControl is false', async () => {
+    const remoteSession: Session = {
+      ...baseSession,
+      id: 'remote-1',
+      remote: true,
+      host: 'remote-host',
+      tmuxWindow: 'remote:1',
+    }
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [remoteSession]
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-rename', sessionId: 'remote-1', newName: 'new-name' })
+    )
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Remote sessions are read-only',
+    })
+  })
+
+  test('renames remote session via SSH when remoteAllowControl is true', async () => {
+    configState.remoteAllowControl = true
+    const remoteSession: Session = {
+      ...baseSession,
+      id: 'remote-1',
+      remote: true,
+      host: 'remote-host',
+      tmuxWindow: 'remote:1',
+    }
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [remoteSession]
+    sessionManagerState.listWindows = () => []
+
+    const sshCalls: string[][] = []
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      sshCalls.push(command as string[])
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-rename', sessionId: 'remote-1', newName: 'new-name' })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    const sshRenameCall = sshCalls.find(
+      (cmd) => cmd[0] === 'ssh' && cmd.some((a) => a.includes('rename-window'))
+    )
+    expect(sshRenameCall).toBeTruthy()
+    expect(sshRenameCall).toContain('remote-host')
+    // Should not send error
+    expect(sent.find((m) => m.type === 'error')).toBeUndefined()
+  })
+
+  test('validates remote rename name format', async () => {
+    configState.remoteAllowControl = true
+    const remoteSession: Session = {
+      ...baseSession,
+      id: 'remote-1',
+      remote: true,
+      host: 'remote-host',
+      tmuxWindow: 'remote:1',
+    }
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [remoteSession]
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    // Empty name
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-rename', sessionId: 'remote-1', newName: '  ' })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Name cannot be empty',
+    })
+
+    // Invalid characters
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-rename', sessionId: 'remote-1', newName: 'bad name!' })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Name can only contain letters, numbers, hyphens, and underscores',
+    })
+  })
+
+  test('sends error when remote SSH rename fails', async () => {
+    configState.remoteAllowControl = true
+    const remoteSession: Session = {
+      ...baseSession,
+      id: 'remote-1',
+      remote: true,
+      host: 'remote-host',
+      tmuxWindow: 'remote:1',
+    }
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [remoteSession]
+
+    spawnSyncImpl = ((..._args: Parameters<typeof Bun.spawnSync>) => ({
+      exitCode: 1,
+      stdout: Buffer.from(''),
+      stderr: Buffer.from('rename failed'),
+    })) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-rename', sessionId: 'remote-1', newName: 'valid-name' })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'rename failed',
+    })
+  })
+
+  test('blocks remote session creation when remoteAllowControl is false', async () => {
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions } = await loadIndex()
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        host: 'remote-host',
+      })
+    )
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Remote session creation is disabled',
+    })
+  })
+
+  test('rejects remote create with invalid hostname', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions } = await loadIndex()
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        host: '-invalid-host',
+      })
+    )
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Invalid hostname',
+    })
+  })
+
+  test('rejects remote create when host is not in configured list', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['allowed-host']
+    const { serveOptions } = await loadIndex()
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        host: 'not-allowed-host',
+      })
+    )
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Host is not in the configured remote hosts list',
+    })
+  })
+
+  test('rejects remote create when path does not exist on remote', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions } = await loadIndex()
+    sessionManagerState.listWindows = () => []
+
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      // Fail the test -d check
+      if (command[0] === 'ssh' && command.some((a) => typeof a === 'string' && a.includes('test -d'))) {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(''),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/nonexistent/path',
+        host: 'remote-host',
+      })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Directory does not exist on remote-host: /nonexistent/path',
+    })
+  })
+
+  test('rejects remote create with relative path', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions } = await loadIndex()
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: 'relative/path',
+        host: 'remote-host',
+      })
+    )
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Project path must be an absolute path (starting with /)',
+    })
+  })
+
+  test('rejects remote create with ~ path', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions } = await loadIndex()
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '~/project',
+        host: 'remote-host',
+      })
+    )
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Project path must be an absolute path (starting with /)',
+    })
+  })
+
+  test('rejects remote create with invalid name characters', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions } = await loadIndex()
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        name: 'bad name!',
+        host: 'remote-host',
+      })
+    )
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Name can only contain letters, numbers, hyphens, and underscores',
+    })
+  })
+
+  test('creates remote session via new-window when tmux session exists', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions, registryInstance } = await loadIndex()
+    sessionManagerState.listWindows = () => []
+
+    const sshCalls: string[][] = []
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      sshCalls.push(command as string[])
+      const cmdStr = command.join(' ')
+      // has-session succeeds (session exists)
+      // new-window -P -F returns window index and ID
+      if (cmdStr.includes('new-window')) {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from('1\t@5\n'),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        name: 'test-name',
+        command: 'claude',
+        host: 'remote-host',
+      })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    // Should have made SSH calls for: test -d, has-session, new-window
+    const sshCommands = sshCalls.filter((cmd) => cmd[0] === 'ssh')
+    expect(sshCommands.length).toBeGreaterThanOrEqual(3)
+
+    // new-window call should include -P flag for print
+    const newWindowCall = sshCalls.find((cmd) => cmd.some((a) => typeof a === 'string' && a.includes('new-window')))
+    expect(newWindowCall).toBeTruthy()
+    expect(newWindowCall!.some((a) => typeof a === 'string' && a.includes('-P'))).toBe(true)
+
+    // Should have sent session-created
+    const createdMsg = sent.find((m) => m.type === 'session-created')
+    expect(createdMsg).toBeTruthy()
+    if (createdMsg && createdMsg.type === 'session-created') {
+      expect(createdMsg.session.host).toBe('remote-host')
+      expect(createdMsg.session.remote).toBe(true)
+      expect(createdMsg.session.projectPath).toBe('/home/user/project')
+      expect(createdMsg.session.name).toBe('test-name')
+      expect(createdMsg.session.id).toBe('remote:remote-host:agentboard:@5')
+      // tmuxWindow should use stable windowId
+      expect(createdMsg.session.tmuxWindow).toBe('agentboard:@5')
+    }
+
+    // Session should be in registry
+    expect(registryInstance.sessions.some((s) => s.remote && s.host === 'remote-host')).toBe(true)
+  })
+
+  test('sends error when created remote window exits immediately', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions, registryInstance } = await loadIndex()
+    sessionManagerState.listWindows = () => []
+
+    const sshCalls: string[][] = []
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      sshCalls.push(command as string[])
+      const cmdStr = command.join(' ')
+      if (cmdStr.includes('new-window')) {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from('1\t@5\n'),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      // Verify check fails for the new window target (window was created then exited)
+      if (cmdStr.includes('has-session') && cmdStr.includes('agentboard:@5')) {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(''),
+          stderr: Buffer.from("can't find window: @5\n"),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        command: 'bash -lic bash',
+        host: 'remote-host',
+      })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(sent.some((m) => m.type === 'session-created')).toBe(false)
+    expect(sent[sent.length - 1]).toMatchObject({
+      type: 'error',
+      message: expect.stringContaining('Remote window exited immediately on remote-host'),
+    })
+    expect(registryInstance.sessions.some((s) => s.id === 'remote:remote-host:agentboard:@5')).toBe(false)
+
+    // Ensure we attempted to verify the created window target
+    expect(sshCalls.some((cmd) => cmd.join(' ').includes('has-session') && cmd.join(' ').includes('agentboard:@5'))).toBe(true)
+  })
+
+  test('creates remote session via new-session when tmux session does not exist', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions, registryInstance } = await loadIndex()
+    sessionManagerState.listWindows = () => []
+
+    const sshCalls: string[][] = []
+    let sessionCreated = false
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      sshCalls.push(command as string[])
+      const cmdStr = command.join(' ')
+      // has-session fails before new-session, succeeds after (verify check)
+      if (cmdStr.includes('has-session')) {
+        return {
+          exitCode: sessionCreated ? 0 : 1,
+          stdout: Buffer.from(''),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      // new-session -P -F returns window index 0 and ID
+      if (cmdStr.includes('new-session')) {
+        sessionCreated = true
+        return {
+          exitCode: 0,
+          stdout: Buffer.from('0\t@1\n'),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        name: 'my-session',
+        host: 'remote-host',
+      })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    // Should NOT have called new-window (used new-session instead)
+    const newWindowCall = sshCalls.find((cmd) => cmd.some((a) => typeof a === 'string' && a.includes('new-window')))
+    expect(newWindowCall).toBeFalsy()
+
+    // new-session call should include -P and -d flags
+    const newSessionCall = sshCalls.find((cmd) => cmd.some((a) => typeof a === 'string' && a.includes('new-session')))
+    expect(newSessionCall).toBeTruthy()
+    expect(newSessionCall!.some((a) => typeof a === 'string' && a.includes('-P'))).toBe(true)
+
+    // Should have sent session-created with window at index 0
+    const createdMsg = sent.find((m) => m.type === 'session-created')
+    expect(createdMsg).toBeTruthy()
+    if (createdMsg && createdMsg.type === 'session-created') {
+      expect(createdMsg.session.host).toBe('remote-host')
+      expect(createdMsg.session.remote).toBe(true)
+      expect(createdMsg.session.name).toBe('my-session')
+      expect(createdMsg.session.id).toBe('remote:remote-host:agentboard:@1')
+      // tmuxWindow should use stable windowId
+      expect(createdMsg.session.tmuxWindow).toBe('agentboard:@1')
+    }
+
+    expect(registryInstance.sessions.some((s) => s.remote && s.host === 'remote-host')).toBe(true)
+  })
+
+  test('does not drop optimistically created remote session on refresh before poller updates', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions, registryInstance } = await loadIndex()
+    sessionManagerState.listWindows = () => []
+
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      const cmdStr = command.join(' ')
+      if (cmdStr.includes('new-window')) {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from('1\t@5\n'),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { ws } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        name: 'test-name',
+        host: 'remote-host',
+      })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    const createdId = 'remote:remote-host:agentboard:@5'
+    expect(registryInstance.sessions.some((s) => s.id === createdId)).toBe(true)
+
+    const baselineReplaceCalls = replaceSessionsCalls.length
+    websocket.message?.(ws as never, JSON.stringify({ type: 'session-refresh' }))
+
+    for (let i = 0; i < 100 && replaceSessionsCalls.length === baselineReplaceCalls; i++) {
+      await new Promise((r) => setTimeout(r, 5))
+    }
+
+    expect(replaceSessionsCalls.length).toBeGreaterThan(baselineReplaceCalls)
+    expect(registryInstance.sessions.some((s) => s.id === createdId)).toBe(true)
+  })
+
+  test('remote kill is not resurrected by stale poller snapshot on next refresh', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    const listWindowsLine =
+      `agentboard\t1\t@5\told-name\t/home/user/project\t${nowSeconds}\t${nowSeconds}\tclaude\n`
+
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      const cmdStr = command.join(' ')
+      if (cmdStr.includes('list-windows')) {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from(listWindowsLine),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { serveOptions, registryInstance } = await loadIndex()
+    sessionManagerState.listWindows = () => []
+    await new Promise((r) => setTimeout(r, 0)) // allow initial remote poll to populate snapshot
+
+    const remoteSession: Session = {
+      id: 'remote:remote-host:agentboard:@5',
+      name: 'old-name',
+      tmuxWindow: 'agentboard:@5',
+      projectPath: '/home/user/project',
+      status: 'unknown',
+      lastActivity: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      source: 'managed',
+      host: 'remote-host',
+      remote: true,
+      command: 'claude',
+    }
+    registryInstance.sessions = [remoteSession]
+
+    const { ws } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-kill', sessionId: remoteSession.id })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+    expect(registryInstance.sessions.some((s) => s.id === remoteSession.id)).toBe(
+      false
+    )
+
+    const baselineReplaceCalls = replaceSessionsCalls.length
+    websocket.message?.(ws as never, JSON.stringify({ type: 'session-refresh' }))
+    for (let i = 0; i < 100 && replaceSessionsCalls.length === baselineReplaceCalls; i++) {
+      await new Promise((r) => setTimeout(r, 5))
+    }
+
+    expect(replaceSessionsCalls.length).toBeGreaterThan(baselineReplaceCalls)
+    expect(registryInstance.sessions.some((s) => s.id === remoteSession.id)).toBe(
+      false
+    )
+  })
+
+  test('remote rename is not reverted by stale poller snapshot on next refresh', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    const listWindowsLine =
+      `agentboard\t1\t@5\told-name\t/home/user/project\t${nowSeconds}\t${nowSeconds}\tclaude\n`
+
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      const cmdStr = command.join(' ')
+      if (cmdStr.includes('list-windows')) {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from(listWindowsLine),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { serveOptions, registryInstance } = await loadIndex()
+    sessionManagerState.listWindows = () => []
+    await new Promise((r) => setTimeout(r, 0))
+
+    const remoteSession: Session = {
+      id: 'remote:remote-host:agentboard:@5',
+      name: 'old-name',
+      tmuxWindow: 'agentboard:@5',
+      projectPath: '/home/user/project',
+      status: 'unknown',
+      lastActivity: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      source: 'managed',
+      host: 'remote-host',
+      remote: true,
+      command: 'claude',
+    }
+    registryInstance.sessions = [remoteSession]
+
+    const { ws } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-rename',
+        sessionId: remoteSession.id,
+        newName: 'new-name',
+      })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(registryInstance.get(remoteSession.id)?.name).toBe('new-name')
+
+    const baselineReplaceCalls = replaceSessionsCalls.length
+    websocket.message?.(ws as never, JSON.stringify({ type: 'session-refresh' }))
+    for (let i = 0; i < 100 && replaceSessionsCalls.length === baselineReplaceCalls; i++) {
+      await new Promise((r) => setTimeout(r, 5))
+    }
+
+    expect(replaceSessionsCalls.length).toBeGreaterThan(baselineReplaceCalls)
+    expect(registryInstance.get(remoteSession.id)?.name).toBe('new-name')
+  })
+
+  test('sends error when remote new-window fails', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions } = await loadIndex()
+    sessionManagerState.listWindows = () => []
+
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      const cmdStr = command.join(' ')
+      // has-session succeeds, but new-window fails
+      if (cmdStr.includes('new-window')) {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(''),
+          stderr: Buffer.from('create window failed'),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        host: 'remote-host',
+      })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Failed to create remote window: create window failed',
+    })
+  })
+
+  test('sends error when remote new-session fails (no existing session)', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions } = await loadIndex()
+    sessionManagerState.listWindows = () => []
+
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      const cmdStr = command.join(' ')
+      // has-session fails (no existing session)
+      if (cmdStr.includes('has-session')) {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(''),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      // new-session also fails
+      if (cmdStr.includes('new-session')) {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(''),
+          stderr: Buffer.from('session create failed'),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        host: 'remote-host',
+      })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'error',
+      message: 'Failed to create remote window: session create failed',
+    })
+  })
+
+  test('sends error when remote command exits immediately after creation', async () => {
+    configState.remoteAllowControl = true
+    configState.remoteHosts = ['remote-host']
+    const { serveOptions, registryInstance } = await loadIndex()
+    sessionManagerState.listWindows = () => []
+
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      const cmdStr = command.join(' ')
+      // new-session succeeds (tmux returns output) but session dies immediately
+      if (cmdStr.includes('new-session') && cmdStr.includes('-P')) {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from('0\t@1\n'),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      // All has-session calls fail (session never persists)
+      if (cmdStr.includes('has-session')) {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(''),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) throw new Error('WebSocket handlers not configured')
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-create',
+        projectPath: '/home/user/project',
+        command: 'nonexistent-shell',
+        host: 'remote-host',
+      })
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    // Should NOT have added session to registry
+    expect(registryInstance.sessions.some((s) => s.remote && s.host === 'remote-host')).toBe(false)
+
+    // Should have sent a helpful error
+    const errorMsg = sent[sent.length - 1]
+    expect(errorMsg.type).toBe('error')
+    if (errorMsg.type === 'error') {
+      expect(errorMsg.message).toContain('nonexistent-shell')
+      expect(errorMsg.message).toContain('remote-host')
+    }
+  })
+
+  test('attaches terminals and forwards input/output', async () => {
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [baseSession]
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    websocket.open?.(ws as never)
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'terminal-attach',
+        sessionId: baseSession.id,
+        tmuxTarget: baseSession.tmuxWindow,
+      })
+    )
+
+    // Wait for async attach operations to complete
+    await new Promise((r) => setTimeout(r, 0))
+
+    const attached = ws.data.terminal
+    if (!attached) {
+      throw new Error('Expected terminal to be created')
+    }
+
+    expect(attached.starts).toBe(1)
+    expect(attached.switchTargets).toEqual([baseSession.tmuxWindow])
+    expect(ws.data.currentSessionId).toBe(baseSession.id)
+    expect(
+      sent.some(
+        (message) =>
+          message.type === 'terminal-ready' &&
+          message.sessionId === baseSession.id
+      )
+    ).toBe(true)
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'terminal-input',
+        sessionId: baseSession.id,
+        data: 'ls',
+      })
+    )
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'terminal-resize',
+        sessionId: baseSession.id,
+        cols: 120,
+        rows: 40,
+      })
+    )
+
+    expect(attached?.writes).toEqual(['ls'])
+    expect(attached?.resizes).toEqual([{ cols: 120, rows: 40 }])
+
+    attached?.emitData('output')
+    expect(sent.some((message) => message.type === 'terminal-output')).toBe(true)
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'terminal-detach', sessionId: baseSession.id })
+    )
+    expect(ws.data.currentSessionId).toBe(null)
+    expect(attached?.disposed).toBe(false)
+
+    const outputCount = sent.filter(
+      (message) => message.type === 'terminal-output'
+    ).length
+    attached?.emitData('ignored')
+    const outputCountAfter = sent.filter(
+      (message) => message.type === 'terminal-output'
+    ).length
+    expect(outputCountAfter).toBe(outputCount)
+  })
+
+  test('session-only attach stays valid and tracks grouped target in pty mode', async () => {
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [baseSession]
+
+    const { ws } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    let captureTarget = ''
+    let copyModeTarget = ''
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      if (command[0] === 'tmux' && command[1] === 'capture-pane') {
+        captureTarget = command[3] ?? ''
+      }
+      if (command[0] === 'tmux' && command[1] === 'display-message') {
+        copyModeTarget = command[4] ?? ''
+        return {
+          exitCode: 0,
+          stdout: Buffer.from('0\n'),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    websocket.open?.(ws as never)
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'terminal-attach',
+        sessionId: baseSession.id,
+        tmuxTarget: 'agentboard',
+      })
+    )
+
+    await new Promise((r) => setTimeout(r, 0))
+
+    const attached = ws.data.terminal
+    if (!attached) {
+      throw new Error('Expected terminal to be created')
+    }
+
+    const groupedTarget = `${configState.tmuxSession}-ws-${ws.data.connectionId}`
+    expect(attached.switchTargets).toEqual(['agentboard'])
+    expect(captureTarget).toBe(groupedTarget)
+    expect(ws.data.currentTmuxTarget).toBe(groupedTarget)
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'tmux-check-copy-mode', sessionId: baseSession.id })
+    )
+    expect(copyModeTarget).toBe(groupedTarget)
+  })
+
+  test('validates tmux target on terminal attach', async () => {
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [baseSession]
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'terminal-attach',
+        sessionId: baseSession.id,
+        tmuxTarget: 'bad target',
+      })
+    )
+
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'terminal-error',
+      sessionId: baseSession.id,
+      code: 'ERR_INVALID_WINDOW',
+      message: 'Invalid tmux target',
+      retryable: false,
+    })
+  })
+
+  test('handles copy-mode commands for active session', async () => {
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [baseSession]
+
+    const { ws, sent } = createWs()
+    ws.data.currentSessionId = baseSession.id
+    ws.data.currentTmuxTarget = 'agentboard:1.1'
+
+    let sendKeysTarget = ''
+    let displayTarget = ''
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      if (command[0] === 'tmux' && command[1] === 'send-keys') {
+        sendKeysTarget = command[4] ?? ''
+      }
+      if (command[0] === 'tmux' && command[1] === 'display-message') {
+        displayTarget = command[4] ?? ''
+        return {
+          exitCode: 0,
+          stdout: Buffer.from('1\n'),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'tmux-cancel-copy-mode', sessionId: baseSession.id })
+    )
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'tmux-check-copy-mode', sessionId: baseSession.id })
+    )
+
+    expect(sendKeysTarget).toBe('agentboard:1.1')
+    expect(displayTarget).toBe('agentboard:1.1')
+
+    const statusMessage = sent.find(
+      (message) => message.type === 'tmux-copy-mode-status'
+    )
+    expect(statusMessage).toEqual({
+      type: 'tmux-copy-mode-status',
+      sessionId: baseSession.id,
+      inCopyMode: true,
+    })
+  })
+
+  test('pins and unpins sessions with validation', async () => {
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [{ ...baseSession, agentSessionId: baseSession.id }]
+    seedRecord(
+      makeRecord({
+        sessionId: baseSession.id,
+        currentWindow: baseSession.tmuxWindow,
+      })
+    )
+
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-pin',
+        sessionId: baseSession.id,
+        isPinned: 'yes',
+      })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'session-pin-result',
+      sessionId: baseSession.id,
+      ok: false,
+      error: 'isPinned must be a boolean',
+    })
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-pin',
+        sessionId: 'bad id',
+        isPinned: true,
+      })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'session-pin-result',
+      sessionId: 'bad id',
+      ok: false,
+      error: 'Invalid session id',
+    })
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-pin',
+        sessionId: 'missing',
+        isPinned: true,
+      })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'session-pin-result',
+      sessionId: 'missing',
+      ok: false,
+      error: 'Session not found',
+    })
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-pin',
+        sessionId: baseSession.id,
+        isPinned: true,
+      })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'session-pin-result',
+      sessionId: baseSession.id,
+      ok: true,
+    })
+    expect(dbState.updateCalls).toHaveLength(1)
+    expect(dbState.updateCalls[0]?.patch).toMatchObject({
+      isPinned: true,
+      lastResumeError: null,
+    })
+    expect(registryInstance.sessions[0]?.isPinned).toBe(true)
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'session-pin',
+        sessionId: baseSession.id,
+        isPinned: false,
+      })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'session-pin-result',
+      sessionId: baseSession.id,
+      ok: true,
+    })
+    expect(dbState.setPinnedCalls).toEqual([
+      { sessionId: baseSession.id, isPinned: false },
+    ])
+    expect(registryInstance.sessions[0]?.isPinned).toBe(false)
+  })
+
+  test('validates session resume errors', async () => {
+    const { serveOptions } = await loadIndex()
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-resume', sessionId: 'bad id' })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'session-resume-result',
+      sessionId: 'bad id',
+      ok: false,
+      error: { code: 'NOT_FOUND', message: 'Invalid session id' },
+    })
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-resume', sessionId: 'missing' })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'session-resume-result',
+      sessionId: 'missing',
+      ok: false,
+      error: { code: 'NOT_FOUND', message: 'Session not found' },
+    })
+
+    seedRecord(
+      makeRecord({
+        sessionId: 'active-session',
+        currentWindow: 'agentboard:9',
+      })
+    )
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-resume', sessionId: 'active-session' })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'session-resume-result',
+      sessionId: 'active-session',
+      ok: false,
+      error: { code: 'ALREADY_ACTIVE', message: 'Session is already active' },
+    })
+
+    configState.claudeResumeCmd = 'claude --resume'
+    seedRecord(
+      makeRecord({
+        sessionId: 'bad-template',
+        currentWindow: null,
+        agentType: 'claude',
+      })
+    )
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-resume', sessionId: 'bad-template' })
+    )
+    expect(sent[sent.length - 1]).toEqual({
+      type: 'session-resume-result',
+      sessionId: 'bad-template',
+      ok: false,
+      error: {
+        code: 'RESUME_FAILED',
+        message: 'Resume command template missing {sessionId} placeholder',
+      },
+    })
+  })
+
+  test('resumes sessions and broadcasts activation', async () => {
+    const { serveOptions, registryInstance } = await loadIndex()
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+    websocket.open?.(ws as never)
+
+    const record = makeRecord({
+      sessionId: 'resume-ok',
+      displayName: 'resume',
+      projectPath: '/tmp/resume',
+      agentType: 'claude',
+      currentWindow: null,
+    })
+    seedRecord(record)
+
+    let createArgs: { projectPath: string; name?: string; command?: string } | null = null
+    const createdSession: Session = {
+      ...baseSession,
+      id: 'created-session',
+      name: 'resume',
+      tmuxWindow: 'agentboard:99',
+    }
+    sessionManagerState.createWindow = (projectPath, name, command) => {
+      createArgs = { projectPath, name, command }
+      return createdSession
+    }
+
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({ type: 'session-resume', sessionId: 'resume-ok' })
+    )
+
+    expect(createArgs).not.toBeNull()
+    expect(createArgs!).toEqual({
+      projectPath: '/tmp/resume',
+      name: 'resume',
+      command: 'claude --resume resume-ok',
+    })
+    expect(dbState.updateCalls[0]?.patch).toMatchObject({
+      currentWindow: createdSession.tmuxWindow,
+      displayName: createdSession.name,
+      lastResumeError: null,
+    })
+
+    const resumeMessage = sent.find(
+      (message) => message.type === 'session-resume-result' && message.ok
+    )
+    expect(resumeMessage).toEqual({
+      type: 'session-resume-result',
+      sessionId: 'resume-ok',
+      ok: true,
+      session: createdSession,
+    })
+
+    const activatedMessage = sent.find(
+      (message) => message.type === 'session-activated'
+    )
+    expect(activatedMessage).toMatchObject({
+      type: 'session-activated',
+      window: createdSession.tmuxWindow,
+    })
+
+    expect(registryInstance.sessions[0]?.id).toBe(createdSession.id)
+  })
+
+  test('websocket close disposes all terminals', async () => {
+    const { serveOptions } = await loadIndex()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    const { ws } = createWs()
+    websocket.open?.(ws as never)
+
+    const terminal = ws.data.terminal
+    if (!terminal) {
+      throw new Error('Expected terminal to be created')
+    }
+
+    websocket.close?.(ws as never, 1000, 'test')
+
+    expect(terminal.disposed).toBe(true)
+    expect(ws.data.terminal).toBe(null)
+  })
+})
+
+describe('server signal handlers', () => {
+  test('SIGINT and SIGTERM cleanup terminals and exit', async () => {
+    const handlers = new Map<string, () => void>()
+    processAny.on = ((event: string, handler: () => void) => {
+      handlers.set(event, handler)
+      return processAny
+    }) as typeof processAny.on
+
+    const exitCodes: number[] = []
+    processAny.exit = ((code?: number) => {
+      exitCodes.push(code ?? 0)
+      return undefined as never
+    }) as typeof processAny.exit
+
+    const { serveOptions, registryInstance } = await loadIndex()
+    registryInstance.sessions = [baseSession]
+
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    const { ws } = createWs()
+    websocket.open?.(ws as never)
+    websocket.message?.(
+      ws as never,
+      JSON.stringify({
+        type: 'terminal-attach',
+        sessionId: baseSession.id,
+        tmuxTarget: baseSession.tmuxWindow,
+      })
+    )
+
+    const attached = ws.data.terminal
+    if (!attached) {
+      throw new Error('Expected terminal to be created')
+    }
+
+    handlers.get('SIGINT')?.()
+    handlers.get('SIGTERM')?.()
+
+    // cleanupAllTerminals is async — wait for the .finally() callbacks
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(attached?.disposed).toBe(true)
+    expect(exitCodes).toEqual([0, 0])
+  })
+})
+
+describe('server fetch handlers', () => {
+  test('server-info returns tailscale ip when available', async () => {
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      if (command[0] === 'tailscale') {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from('100.64.0.42\n'),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    const { serveOptions } = await loadIndex()
+    const fetchHandler = serveOptions.fetch
+    if (!fetchHandler) {
+      throw new Error('Fetch handler not configured')
+    }
+
+    const response = await fetchHandler.call(
+      {} as Bun.Server<unknown>,
+      new Request('http://localhost/api/server-info'),
+      {} as Bun.Server<unknown>
+    )
+
+    if (!response) {
+      throw new Error('Expected response for server-info request')
+    }
+
+    const payload = (await response.json()) as {
+      port: number
+      tailscaleIp: string | null
+      protocol: string
+    }
+    expect(payload.port).toBe(4040)
+    expect(payload.protocol).toBe('http')
+    expect(payload.tailscaleIp).toBe('100.64.0.42')
+  })
+
+  test('returns no response for successful websocket upgrades', async () => {
+    const { serveOptions } = await loadIndex()
+    const fetchHandler = serveOptions.fetch
+    if (!fetchHandler) {
+      throw new Error('Fetch handler not configured')
+    }
+
+    const upgradeCalls: Array<{ url: string }> = []
+    const server = {
+      upgrade: (req: Request) => {
+        upgradeCalls.push({ url: req.url })
+        return true
+      },
+    } as unknown as Bun.Server<unknown>
+
+    const response = await fetchHandler.call(
+      server,
+      new Request('http://localhost/ws'),
+      server
+    )
+
+    expect(upgradeCalls).toHaveLength(1)
+    expect(response).toBeUndefined()
+  })
+
+  test('returns upgrade failure for websocket requests', async () => {
+    const { serveOptions } = await loadIndex()
+    const fetchHandler = serveOptions.fetch
+    if (!fetchHandler) {
+      throw new Error('Fetch handler not configured')
+    }
+    const upgradeCalls: Array<{ url: string }> = []
+    const server = {
+      upgrade: (req: Request) => {
+        upgradeCalls.push({ url: req.url })
+        return false
+      },
+    } as unknown as Bun.Server<unknown>
+
+    const response = await fetchHandler.call(
+      server,
+      new Request('http://localhost/ws'),
+      server
+    )
+
+    if (!response) {
+      throw new Error('Expected response for websocket upgrade')
+    }
+
+    expect(upgradeCalls).toHaveLength(1)
+    expect(response.status).toBe(400)
+    expect(await response.text()).toBe('WebSocket upgrade failed')
+  })
+
+  test('handles paste-image requests with and without files', async () => {
+    const { serveOptions, registryInstance } = await loadIndex()
+    const fetchHandler = serveOptions.fetch
+    if (!fetchHandler) {
+      throw new Error('Fetch handler not configured')
+    }
+
+    const server = {} as Bun.Server<unknown>
+    registryInstance.sessions = [baseSession]
+
+    const healthResponse = await fetchHandler.call(
+      server,
+      new Request('http://localhost/api/health'),
+      server
+    )
+    if (!healthResponse) {
+      throw new Error('Expected response for health request')
+    }
+    expect((await healthResponse.json()) as { ok: boolean }).toEqual({ ok: true })
+
+    const sessionsResponse = await fetchHandler.call(
+      server,
+      new Request('http://localhost/api/sessions'),
+      server
+    )
+    if (!sessionsResponse) {
+      throw new Error('Expected response for sessions request')
+    }
+    const sessions = (await sessionsResponse.json()) as Session[]
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]?.id).toBe(baseSession.id)
+
+    const emptyResponse = await fetchHandler.call(
+      server,
+      new Request('http://localhost/api/paste-image', {
+        method: 'POST',
+        body: new FormData(),
+      }),
+      server
+    )
+
+    if (!emptyResponse) {
+      throw new Error('Expected response for paste-image without files')
+    }
+
+    expect(emptyResponse.status).toBe(400)
+
+    const formData = new FormData()
+    const file = new File([new Uint8Array([1, 2, 3])], 'paste.png', {
+      type: 'image/png',
+    })
+    formData.append('image', file)
+
+    const uploadResponse = await fetchHandler.call(
+      server,
+      new Request('http://localhost/api/paste-image', {
+        method: 'POST',
+        body: formData,
+      }),
+      server
+    )
+
+    if (!uploadResponse) {
+      throw new Error('Expected response for paste-image upload')
+    }
+
+    const payload = (await uploadResponse.json()) as { path: string }
+    expect(uploadResponse.ok).toBe(true)
+    expect(payload.path.startsWith('/tmp/paste-')).toBe(true)
+    expect(payload.path.endsWith('.png')).toBe(true)
+  })
+
+  test('returns 500 when paste-image upload fails', async () => {
+    const { serveOptions } = await loadIndex()
+    const fetchHandler = serveOptions.fetch
+    if (!fetchHandler) {
+      throw new Error('Fetch handler not configured')
+    }
+
+    writeImpl = async () => {
+      throw new Error('write-failed')
+    }
+
+    const formData = new FormData()
+    const file = new File([new Uint8Array([1, 2, 3])], 'paste.png', {
+      type: 'image/png',
+    })
+    formData.append('image', file)
+
+    const response = await fetchHandler.call(
+      {} as Bun.Server<unknown>,
+      new Request('http://localhost/api/paste-image', {
+        method: 'POST',
+        body: formData,
+      }),
+      {} as Bun.Server<unknown>
+    )
+
+    if (!response) {
+      throw new Error('Expected response for paste-image failure')
+    }
+
+    expect(response.status).toBe(500)
+    const payload = (await response.json()) as { error: string }
+    expect(payload.error).toBe('write-failed')
+  })
+
+  test('returns session preview for existing logs', async () => {
+    const { serveOptions } = await loadIndex()
+    const fetchHandler = serveOptions.fetch
+    if (!fetchHandler) {
+      throw new Error('Fetch handler not configured')
+    }
+
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-preview-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const lines = Array.from({ length: 120 }, (_, index) => `line-${index}`)
+    await fs.writeFile(logPath, lines.join('\n'))
+
+    seedRecord(
+      makeRecord({
+        sessionId: 'session-preview',
+        logFilePath: logPath,
+        displayName: 'Preview',
+        projectPath: '/tmp/preview',
+        agentType: 'codex',
+      })
+    )
+
+    try {
+      const response = await fetchHandler.call(
+        {} as Bun.Server<unknown>,
+        new Request('http://localhost/api/session-preview/session-preview'),
+        {} as Bun.Server<unknown>
+      )
+
+      if (!response) {
+        throw new Error('Expected response for session preview')
+      }
+
+      expect(response.ok).toBe(true)
+      const payload = (await response.json()) as {
+        sessionId: string
+        displayName: string
+        projectPath: string
+        agentType: string
+        lines: string[]
+      }
+      expect(payload.sessionId).toBe('session-preview')
+      expect(payload.displayName).toBe('Preview')
+      expect(payload.projectPath).toBe('/tmp/preview')
+      expect(payload.agentType).toBe('codex')
+      expect(payload.lines).toHaveLength(100)
+      expect(payload.lines[0]).toBe('line-20')
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('returns 404 when session preview log is missing', async () => {
+    const { serveOptions } = await loadIndex()
+    const fetchHandler = serveOptions.fetch
+    if (!fetchHandler) {
+      throw new Error('Fetch handler not configured')
+    }
+
+    seedRecord(
+      makeRecord({
+        sessionId: 'missing-log',
+        logFilePath: path.join('/tmp', 'missing-log.jsonl'),
+      })
+    )
+
+    const response = await fetchHandler.call(
+      {} as Bun.Server<unknown>,
+      new Request('http://localhost/api/session-preview/missing-log'),
+      {} as Bun.Server<unknown>
+    )
+
+    if (!response) {
+      throw new Error('Expected response for missing log')
+    }
+
+    expect(response.status).toBe(404)
+    const payload = (await response.json()) as { error: string }
+    expect(payload.error).toBe('Log file not found')
+  })
+})
+
+describe('server startup side effects', () => {
+  test('prunes unattached websocket sessions on startup', async () => {
+    const calls: string[][] = []
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      calls.push(command as string[])
+      if (command[0] === 'tmux' && command[1] === 'list-sessions') {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from(
+            ['agentboard-ws-1\t0', 'agentboard-ws-2\t1', 'other\t0'].join('\n')
+          ),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      if (command[0] === 'tmux' && command[1] === 'kill-session') {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from(''),
+          stderr: Buffer.from(''),
+        } as ReturnType<typeof Bun.spawnSync>
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+
+    await loadIndex()
+
+    const killCalls = calls.filter(
+      (command) => command[0] === 'tmux' && command[1] === 'kill-session'
+    )
+    expect(killCalls).toHaveLength(1)
+    expect(killCalls[0]).toEqual(['tmux', 'kill-session', '-t', 'agentboard-ws-1'])
+  })
+
+  test('ping message returns pong and echoes seq when provided', async () => {
+    const { serveOptions } = await loadIndex()
+    const { ws, sent } = createWs()
+    const websocket = serveOptions.websocket
+    if (!websocket) {
+      throw new Error('WebSocket handlers not configured')
+    }
+
+    websocket.message?.(ws as never, JSON.stringify({ type: 'ping' }))
+    websocket.message?.(ws as never, JSON.stringify({ type: 'ping', seq: 123 }))
+
+    expect(sent).toContainEqual({ type: 'pong' })
+    expect(sent).toContainEqual({ type: 'pong', seq: 123 })
+  })
+
+  test('/api/client-log returns ok for valid JSON', async () => {
+    const { serveOptions } = await loadIndex()
+    const fetchHandler = serveOptions.fetch
+    if (!fetchHandler) {
+      throw new Error('Fetch handler not configured')
+    }
+
+    const server = {} as Bun.Server<unknown>
+    const response = await fetchHandler.call(
+      server,
+      new Request('http://localhost/api/client-log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: 'test_event', data: { foo: 'bar' } }),
+      }),
+      server
+    )
+
+    if (!response) {
+      throw new Error('Expected response for client-log request')
+    }
+
+    expect(response.status).toBe(200)
+    const payload = (await response.json()) as { ok: boolean }
+    expect(payload.ok).toBe(true)
+  })
+
+  test('/api/client-log handles malformed body gracefully', async () => {
+    const { serveOptions } = await loadIndex()
+    const fetchHandler = serveOptions.fetch
+    if (!fetchHandler) {
+      throw new Error('Fetch handler not configured')
+    }
+
+    const server = {} as Bun.Server<unknown>
+    const response = await fetchHandler.call(
+      server,
+      new Request('http://localhost/api/client-log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{bad-json}',
+      }),
+      server
+    )
+
+    if (!response) {
+      throw new Error('Expected response for malformed client-log')
+    }
+
+    expect(response.status).toBe(200)
+    const payload = (await response.json()) as { ok: boolean }
+    expect(payload.ok).toBe(true)
+  })
+
+  test('does not run sync window verification before startup is ready', async () => {
+    const syncCapturePaneCalls: string[][] = []
+    seedRecord(
+      makeRecord({
+        sessionId: 'session-active',
+        displayName: baseSession.name,
+        currentWindow: baseSession.tmuxWindow,
+        logFilePath: path.join('/tmp', 'session-active.jsonl'),
+      })
+    )
+    sessionManagerState.listWindows = () => [baseSession]
+
+    spawnSyncImpl = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      if (command[0] === 'tmux' && command[1] === 'capture-pane') {
+        syncCapturePaneCalls.push(command as string[])
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(''),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }) as typeof Bun.spawnSync
+    bunAny.spawn = ((...args: Parameters<typeof Bun.spawn>) => {
+      const cmd = Array.isArray(args[0]) ? args[0] : [String(args[0])]
+      return {
+        exited: Promise.resolve(0),
+        stdout: new ReadableStream({
+          start(controller) {
+            if (cmd[0] === 'tmux' && cmd[1] === 'capture-pane') {
+              controller.enqueue(new TextEncoder().encode(''))
+            }
+            controller.close()
+          },
+        }),
+        stderr: new ReadableStream({
+          start(controller) {
+            controller.close()
+          },
+        }),
+        kill: () => {},
+        pid: 12345,
+      } as unknown as ReturnType<typeof Bun.spawn>
+    }) as typeof Bun.spawn
+
+    await loadIndex()
+
+    expect(serveOptions).not.toBeNull()
+    expect(syncCapturePaneCalls).toHaveLength(0)
+  })
+})

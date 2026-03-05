@@ -1,0 +1,17 @@
+node_modules
+.DS_Store
+.env
+.env.*
+dist
+coverage
+*.log
+*.tmp
+.vscode
+.idea
+playwright-report
+test-results
+systemd/agentboard.service
+# Nightshift plan artifacts (keep out of version control)
+.nightshift-plan
+/.cachebro
+/.agentcache
