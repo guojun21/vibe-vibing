@@ -75,6 +75,43 @@ export interface DirectoryErrorResponse {
   message: string
 }
 
+export interface TeamMemberConfig {
+  role: 'cc'
+  agentType: AgentType
+  name: string
+  command?: string
+  projectPath?: string
+}
+
+export interface TeamConfig {
+  members: TeamMemberConfig[]
+  defaultProjectPath: string
+}
+
+export interface Team {
+  teamId: string
+  name: string
+  createdAt: string
+  updatedAt: string
+  status: 'active' | 'archived'
+  config: TeamConfig
+}
+
+export interface TeamRuntimeStatus {
+  teamId: string
+  isRunning: boolean
+  ccStatuses: Record<string, string>
+  daSessionId: string | null
+}
+
+export interface DAMessage {
+  messageId: string
+  teamId: string
+  role: 'user' | 'da' | 'system'
+  content: string
+  timestamp: string
+}
+
 export type ServerMessage =
   | { type: 'sessions'; sessions: Session[] }
   | { type: 'session-update'; session: Session }
@@ -101,6 +138,13 @@ export type ServerMessage =
   | { type: 'pong'; seq?: number }
   | { type: 'error'; message: string }
   | { type: 'kill-failed'; sessionId: string; message: string }
+  | { type: 'teams'; teams: Team[] }
+  | { type: 'team-created'; team: Team }
+  | { type: 'team-updated'; team: Team }
+  | { type: 'team-status'; status: TeamRuntimeStatus }
+  | { type: 'da-message'; teamId: string; message: DAMessage }
+  | { type: 'da-history'; teamId: string; messages: DAMessage[] }
+  | { type: 'cc-status-update'; teamId: string; statuses: Record<string, string> }
 
 export interface ResumeError {
   code: 'NOT_FOUND' | 'ALREADY_ACTIVE' | 'RESUME_FAILED'
@@ -127,6 +171,14 @@ export type ClientMessage =
   | { type: 'session-resume'; sessionId: string; name?: string }
   | { type: 'ping'; seq?: number }
   | { type: 'session-pin'; sessionId: string; isPinned: boolean }
+  | { type: 'team-create'; name: string; members: TeamMemberConfig[]; defaultProjectPath: string }
+  | { type: 'team-update'; teamId: string; name?: string; config?: Partial<TeamConfig> }
+  | { type: 'team-delete'; teamId: string }
+  | { type: 'team-start'; teamId: string }
+  | { type: 'team-stop'; teamId: string }
+  | { type: 'team-select'; teamId: string }
+  | { type: 'da-input'; teamId: string; text: string }
+  | { type: 'da-history-request'; teamId: string; limit?: number }
 
 // Typed function signatures for client-side messaging
 export type SendClientMessage = (message: ClientMessage) => void

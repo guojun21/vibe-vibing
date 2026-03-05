@@ -52,6 +52,9 @@ import { normalizePaneStartCommand } from './agent-type-detection-from-process'
 import { generateSessionName } from './random-session-name-generator'
 import { shellQuote } from './shell-argument-escaping'
 import { SshTerminalProxy } from './terminal/ssh-remote-terminal-proxy'
+import { connectMongoDB, closeMongoDB } from './database/mongodb-connection'
+import * as teamRepo from './database/team-repository'
+import { startTeam, stopTeam, sendDAInput, getDAHistory, getActiveTeam, getAllActiveTeams } from './team-lifecycle-service'
 
 function checkPortAvailable(port: number): void {
   let result: ReturnType<typeof Bun.spawnSync>
@@ -186,6 +189,7 @@ logger.info('terminal_mode_resolved', {
 
 const app = new Hono()
 const db = initDatabase()
+void connectMongoDB().catch(err => logger.warn('mongodb_connect_failed', { error: String(err) }))
 
 // Read mouse mode setting from DB (default: true)
 const TMUX_MOUSE_MODE_KEY = 'tmux_mouse_mode'
@@ -1189,6 +1193,13 @@ Bun.serve<WSData>({
         inactive: agentSessions.inactive,
       })
       initializePersistentTerminal(ws)
+      // Send team list on connect
+      void (async () => {
+        try {
+          const teams = await teamRepo.listAllTeams()
+          send(ws, { type: 'teams', teams: teams.map(t => ({ teamId: t.teamId, name: t.name, createdAt: t.createdAt.toISOString(), updatedAt: t.updatedAt.toISOString(), status: t.status, config: t.config })) } as any)
+        } catch {}
+      })()
     },
     message(ws, message) {
       handleMessage(ws, message)
@@ -1231,6 +1242,7 @@ async function cleanupAllTerminals() {
   logPoller.stop()
   remotePoller?.stop()
   db.close()
+  await closeMongoDB()
 }
 
 process.on('SIGINT', () => {
@@ -1355,6 +1367,27 @@ function handleMessage(
       return
     case 'session-pin':
       handleSessionPin(message.sessionId, message.isPinned, ws)
+      return
+    case 'team-create':
+      fireAndForget(handleTeamCreate(message as any, ws), 'handleTeamCreate')
+      return
+    case 'team-update':
+      fireAndForget(handleTeamUpdate(message as any, ws), 'handleTeamUpdate')
+      return
+    case 'team-delete':
+      fireAndForget(handleTeamDelete(message as any, ws), 'handleTeamDelete')
+      return
+    case 'team-start':
+      fireAndForget(handleTeamStart(message as any, ws), 'handleTeamStart')
+      return
+    case 'team-stop':
+      fireAndForget(handleTeamStop(message as any, ws), 'handleTeamStop')
+      return
+    case 'da-input':
+      fireAndForget(handleDAInputMessage(message as any, ws), 'handleDAInput')
+      return
+    case 'da-history-request':
+      fireAndForget(handleDAHistoryRequest(message as any, ws), 'handleDAHistoryRequest')
       return
     default:
       send(ws, { type: 'error', message: 'Unknown message type' })
@@ -2450,4 +2483,140 @@ function handleTerminalError(
   const message =
     error instanceof Error ? error.message : 'Terminal operation failed'
   sendTerminalError(ws, sessionId, fallbackCode, message, true)
+}
+
+async function handleTeamCreate(message: { name: string; members: any[]; defaultProjectPath: string }, ws: ServerWebSocket<WSData>) {
+  const startMs = Date.now()
+  const reqId = `tc_${Date.now()}`
+  logger.info({ reqId, name: message.name, memberCount: message.members?.length, defaultProjectPath: message.defaultProjectPath, event: 'team_create_start' })
+  try {
+    const team = await teamRepo.createTeam(message.name, message.members, message.defaultProjectPath)
+    const teamMsg = { teamId: team.teamId, name: team.name, createdAt: team.createdAt.toISOString(), updatedAt: team.updatedAt.toISOString(), status: team.status, config: team.config }
+    broadcast({ type: 'team-created', team: teamMsg } as any)
+    logger.info({ reqId, teamId: team.teamId, latencyMs: Date.now() - startMs, event: 'team_create_success' })
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
+    logger.error({ reqId, error: errMsg, latencyMs: Date.now() - startMs, event: 'team_create_error' })
+    send(ws, { type: 'error', message: errMsg })
+  }
+}
+
+async function handleTeamUpdate(message: { teamId: string; name?: string; config?: any }, ws: ServerWebSocket<WSData>) {
+  const startMs = Date.now()
+  const reqId = `tu_${Date.now()}`
+  logger.info({ reqId, teamId: message.teamId, hasNameUpdate: !!message.name, hasConfigUpdate: !!message.config, event: 'team_update_start' })
+  try {
+    const updates: any = {}
+    if (message.name) updates.name = message.name
+    if (message.config) updates.config = message.config
+    const team = await teamRepo.updateTeam(message.teamId, updates)
+    if (team) {
+      const teamMsg = { teamId: team.teamId, name: team.name, createdAt: team.createdAt.toISOString(), updatedAt: team.updatedAt.toISOString(), status: team.status, config: team.config }
+      broadcast({ type: 'team-updated', team: teamMsg } as any)
+      logger.info({ reqId, teamId: team.teamId, latencyMs: Date.now() - startMs, event: 'team_update_success' })
+    } else {
+      logger.warn({ reqId, teamId: message.teamId, latencyMs: Date.now() - startMs, event: 'team_update_not_found' })
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
+    logger.error({ reqId, teamId: message.teamId, error: errMsg, latencyMs: Date.now() - startMs, event: 'team_update_error' })
+    send(ws, { type: 'error', message: errMsg })
+  }
+}
+
+async function handleTeamDelete(message: { teamId: string }, ws: ServerWebSocket<WSData>) {
+  const startMs = Date.now()
+  const reqId = `td_${Date.now()}`
+  logger.info({ reqId, teamId: message.teamId, event: 'team_delete_start' })
+  try {
+    await stopTeam(message.teamId)
+    logger.info({ reqId, teamId: message.teamId, event: 'team_delete_stopped' })
+    await teamRepo.archiveTeam(message.teamId)
+    const teams = await teamRepo.listAllTeams()
+    broadcast({ type: 'teams', teams: teams.map(t => ({ teamId: t.teamId, name: t.name, createdAt: t.createdAt.toISOString(), updatedAt: t.updatedAt.toISOString(), status: t.status, config: t.config })) } as any)
+    logger.info({ reqId, teamId: message.teamId, remainingTeams: teams.length, latencyMs: Date.now() - startMs, event: 'team_delete_success' })
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
+    logger.error({ reqId, teamId: message.teamId, error: errMsg, latencyMs: Date.now() - startMs, event: 'team_delete_error' })
+    send(ws, { type: 'error', message: errMsg })
+  }
+}
+
+async function handleTeamStart(message: { teamId: string }, ws: ServerWebSocket<WSData>) {
+  const startMs = Date.now()
+  const reqId = `ts_${Date.now()}`
+  logger.info({ reqId, teamId: message.teamId, event: 'team_start_begin' })
+  try {
+    const runtime = await startTeam(
+      message.teamId,
+      (teamId, statuses) => {
+        logger.debug({ reqId, teamId, statuses, event: 'cc_status_broadcast' })
+        broadcast({ type: 'cc-status-update', teamId, statuses } as any)
+      },
+      (teamId, summary) => {
+        logger.debug({ reqId, teamId, summaryLen: summary.length, event: 'da_summary_broadcast' })
+        broadcast({ type: 'da-message', teamId, message: { messageId: crypto.randomUUID(), teamId, role: 'da', content: summary, timestamp: new Date().toISOString() } } as any)
+      },
+    )
+    const statuses: Record<string, string> = {}
+    for (const inst of runtime.ccInstances) {
+      statuses[inst.name] = inst.status
+    }
+    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId } } as any)
+    logger.info({ reqId, teamId: message.teamId, ccCount: runtime.ccInstances.length, daSessionId: runtime.daSessionId, ccStatuses: statuses, latencyMs: Date.now() - startMs, event: 'team_start_success' })
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
+    logger.error({ reqId, teamId: message.teamId, error: errMsg, stack: err instanceof Error ? err.stack : undefined, latencyMs: Date.now() - startMs, event: 'team_start_error' })
+    send(ws, { type: 'error', message: errMsg })
+  }
+}
+
+async function handleTeamStop(message: { teamId: string }, ws: ServerWebSocket<WSData>) {
+  const startMs = Date.now()
+  const reqId = `tp_${Date.now()}`
+  logger.info({ reqId, teamId: message.teamId, event: 'team_stop_begin' })
+  try {
+    await stopTeam(message.teamId)
+    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: false, ccStatuses: {}, daSessionId: null } } as any)
+    logger.info({ reqId, teamId: message.teamId, latencyMs: Date.now() - startMs, event: 'team_stop_success' })
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
+    logger.error({ reqId, teamId: message.teamId, error: errMsg, latencyMs: Date.now() - startMs, event: 'team_stop_error' })
+    send(ws, { type: 'error', message: errMsg })
+  }
+}
+
+async function handleDAInputMessage(message: { teamId: string; text: string }, ws: ServerWebSocket<WSData>) {
+  const startMs = Date.now()
+  const reqId = `di_${Date.now()}`
+  logger.info({ reqId, teamId: message.teamId, textLen: message.text.length, textPreview: message.text.slice(0, 100), event: 'da_input_start' })
+  try {
+    const result = await sendDAInput(message.teamId, message.text)
+    const hasErrors = result.errors.length > 0
+    const confirmText = hasErrors
+      ? `发送失败: ${result.errors.join(', ')}`
+      : `已发送到所有 CC`
+    broadcast({ type: 'da-message', teamId: message.teamId, message: { messageId: crypto.randomUUID(), teamId: message.teamId, role: 'da', content: confirmText, timestamp: new Date().toISOString() } } as any)
+    logger.info({ reqId, teamId: message.teamId, messageId: result.messageId, errorCount: result.errors.length, errors: hasErrors ? result.errors : undefined, latencyMs: Date.now() - startMs, event: 'da_input_complete' })
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
+    logger.error({ reqId, teamId: message.teamId, error: errMsg, stack: err instanceof Error ? err.stack : undefined, latencyMs: Date.now() - startMs, event: 'da_input_error' })
+    send(ws, { type: 'error', message: errMsg })
+  }
+}
+
+async function handleDAHistoryRequest(message: { teamId: string; limit?: number }, ws: ServerWebSocket<WSData>) {
+  const startMs = Date.now()
+  const reqId = `dh_${Date.now()}`
+  const limit = message.limit || 100
+  logger.info({ reqId, teamId: message.teamId, limit, event: 'da_history_request_start' })
+  try {
+    const messages = await getDAHistory(message.teamId, limit)
+    send(ws, { type: 'da-history', teamId: message.teamId, messages: messages.map(m => ({ messageId: m.messageId, teamId: m.teamId, role: m.role, content: m.content, timestamp: m.timestamp.toISOString() })) } as any)
+    logger.info({ reqId, teamId: message.teamId, messageCount: messages.length, latencyMs: Date.now() - startMs, event: 'da_history_request_success' })
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
+    logger.error({ reqId, teamId: message.teamId, error: errMsg, latencyMs: Date.now() - startMs, event: 'da_history_request_error' })
+    send(ws, { type: 'error', message: errMsg })
+  }
 }

@@ -4,6 +4,7 @@ import Header from './components/application-header-bar'
 import SessionList from './components/session-list-sidebar'
 import Terminal from './components/single-session-terminal-view'
 import SplitView from './components/resizable-split-view-layout'
+import { TeamSidebar } from './components/team-sidebar'
 import NewSessionModal from './components/new-session-creation-modal'
 import SettingsModal from './components/settings-configuration-modal'
 import { ToastViewport, toastManager } from './components/toast-notification-viewport'
@@ -13,6 +14,7 @@ import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
 } from './stores/settings-persistence-store'
+import { useTeamStore } from './stores/team-state-store'
 import { useThemeStore } from './stores/theme-preference-store'
 import { useWebSocket } from './hooks/use-shared-websocket-connection'
 import { useVisualViewport } from './hooks/use-visual-viewport-adjustment'
@@ -65,6 +67,20 @@ export default function App() {
   const hostStatuses = useSessionStore((state) => state.hostStatuses)
   const remoteAllowControl = useSessionStore((state) => state.remoteAllowControl)
   const hostLabel = useSessionStore((state) => state.hostLabel)
+
+  const {
+    teams,
+    selectedTeamId,
+    teamStatuses,
+    daMessages,
+    setTeams,
+    addTeam,
+    updateTeamInStore,
+    selectTeam,
+    setTeamStatus,
+    setDAMessages,
+    addDAMessage,
+  } = useTeamStore()
 
   const theme = useThemeStore((state) => state.theme)
   const defaultProjectDir = useSettingsStore(
@@ -317,6 +333,24 @@ export default function App() {
           timeout: 8000,
         })
       }
+      if (message.type === 'teams') {
+        setTeams(message.teams)
+      }
+      if (message.type === 'team-created') {
+        addTeam(message.team)
+      }
+      if (message.type === 'team-updated') {
+        updateTeamInStore(message.team)
+      }
+      if (message.type === 'team-status') {
+        setTeamStatus(message.status)
+      }
+      if (message.type === 'da-message') {
+        addDAMessage(message.teamId, message.message)
+      }
+      if (message.type === 'da-history') {
+        setDAMessages(message.teamId, message.messages)
+      }
     })
 
     return () => { unsubscribe() }
@@ -334,6 +368,12 @@ export default function App() {
     setHostLabel,
     subscribe,
     updateSession,
+    setTeams,
+    addTeam,
+    updateTeamInStore,
+    setTeamStatus,
+    setDAMessages,
+    addDAMessage,
   ])
 
   const selectedSession = useMemo(() => {
@@ -548,6 +588,8 @@ export default function App() {
           onOpenSettings={handleOpenSettings}
           tailscaleIp={serverInfo?.tailscaleIp ?? null}
         />
+        <TeamSidebar sendMessage={sendMessage} />
+        <div className="h-px bg-white/10" />
         <SessionList
           sessions={sessions}
           inactiveSessions={agentSessions.inactive}
