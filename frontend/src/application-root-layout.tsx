@@ -3,7 +3,7 @@ import type { ServerMessage } from '@shared/shared-message-and-session-types'
 import Header from './components/application-header-bar'
 import SessionList from './components/session-list-sidebar'
 import Terminal from './components/single-session-terminal-view'
-import SplitView from './components/resizable-split-view-layout'
+import TeamView from './components/team-view'
 import { TeamSidebar } from './components/team-sidebar'
 import NewSessionModal from './components/new-session-creation-modal'
 import SettingsModal from './components/settings-configuration-modal'
@@ -57,10 +57,6 @@ export default function App() {
   const connectionError = useSessionStore((state) => state.connectionError)
   const clearExitingSession = useSessionStore((state) => state.clearExitingSession)
   const markSessionExiting = useSessionStore((state) => state.markSessionExiting)
-  const pinnedSessionIds = useSessionStore((state) => state.pinnedSessionIds)
-  const splitViewEnabled = useSessionStore((state) => state.splitViewEnabled)
-  const pinSession = useSessionStore((state) => state.pinSession)
-  const unpinSession = useSessionStore((state) => state.unpinSession)
   const setRemoteAllowControl = useSessionStore((state) => state.setRemoteAllowControl)
   const setRemoteAllowAttach = useSessionStore((state) => state.setRemoteAllowAttach)
   const setHostLabel = useSessionStore((state) => state.setHostLabel)
@@ -176,6 +172,9 @@ export default function App() {
 
   useEffect(() => {
     const unsubscribe = subscribe((message: ServerMessage) => {
+      if (import.meta.env.DEV) {
+        console.log('[WS recv]', message.type, message)
+      }
       if (message.type === 'sessions') {
         // Detect status transitions for sound notifications before updating
         const currentSessions = useSessionStore.getState().sessions
@@ -341,16 +340,37 @@ export default function App() {
       }
       if (message.type === 'team-created') {
         addTeam(message.team)
-        const { selectedTeamId } = useTeamStore.getState()
-        if (!selectedTeamId) {
-          useTeamStore.getState().selectTeam(message.team.teamId)
-        }
+        useTeamStore.getState().selectTeam(message.team.teamId)
+        sendMessage({ type: 'team-select', teamId: message.team.teamId })
       }
       if (message.type === 'team-updated') {
         updateTeamInStore(message.team)
       }
+      if (message.type === 'cc-status-update') {
+        const msg = message as any
+        const { teamStatuses } = useTeamStore.getState()
+        const existing = teamStatuses[msg.teamId]
+        if (existing) {
+          setTeamStatus({ ...existing, ccStatuses: msg.statuses })
+        }
+      }
       if (message.type === 'team-status') {
-        setTeamStatus(message.status)
+        const existing = useTeamStore.getState().teamStatuses[message.status.teamId]
+        setTeamStatus({
+          ...message.status,
+          ccSessions: message.status.ccSessions ?? existing?.ccSessions ?? [],
+        })
+      }
+      if (message.type === 'team-started') {
+        const msg = message as any
+        const ccSessions = msg.ccSessions ?? []
+        setTeamStatus({
+          teamId: msg.teamId,
+          isRunning: true,
+          ccStatuses: {},
+          daSessionId: msg.daSessionId ?? null,
+          ccSessions,
+        })
       }
       if (message.type === 'da-message') {
         addDAMessage(message.teamId, message.message)
@@ -493,26 +513,6 @@ export default function App() {
     }
   }, [hasLoaded, selectedSessionId, sortedSessions, setSelectedSessionId])
 
-  // Auto-pin vc-cc-* sessions for split-view (match by name since ids are UUIDs)
-  useEffect(() => {
-    if (!hasLoaded || !splitViewEnabled) return
-    const vcSessions = sessions.filter((s) =>
-      s.name?.startsWith('vc-cc-') || s.id.startsWith('vc-cc-')
-    )
-    if (vcSessions.length > 0 && pinnedSessionIds.length === 0) {
-      for (const s of vcSessions.slice(0, 4)) {
-        pinSession(s.id)
-      }
-    }
-  }, [hasLoaded, sessions, splitViewEnabled, pinnedSessionIds.length, pinSession])
-
-  // Resolve pinned session objects
-  const pinnedSessions = useMemo(
-    () => pinnedSessionIds
-      .map((id) => sessions.find((s) => s.id === id))
-      .filter((s): s is NonNullable<typeof s> => s != null),
-    [pinnedSessionIds, sessions]
-  )
 
   const handleKillSession = useCallback((sessionId: string) => {
     // Mark as exiting before sending kill to preserve session data for exit animation
@@ -666,10 +666,10 @@ export default function App() {
         onMouseDown={handleResizeStart}
       />
 
-      {/* Main content: SplitView or single Terminal */}
-      {splitViewEnabled && pinnedSessions.length > 0 ? (
+      {/* Main content: TeamView when a team is selected, otherwise single Terminal */}
+      {selectedTeamId ? (
         <div className="flex-1 min-w-0 min-h-0 h-full overflow-hidden">
-          <SplitView pinnedSessions={pinnedSessions} sendMessage={sendMessage} />
+          <TeamView teamId={selectedTeamId} sendMessage={sendMessage} />
         </div>
       ) : (
         <Terminal

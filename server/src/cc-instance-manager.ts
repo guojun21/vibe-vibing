@@ -27,7 +27,7 @@ function createTmuxSession(name: string, dir: string, program: string): void {
   if (tmuxSessionExists(name)) {
     throw new Error(`tmux session "${name}" already exists`)
   }
-  const shellCmd = `export PATH="$HOME/.claude/local:$HOME/.local/bin:$PATH"; exec ${program}`
+  const shellCmd = `source ~/.zshrc 2>/dev/null; [ -s "$HOME/.nvm/nvm.sh" ] && source "$HOME/.nvm/nvm.sh" && nvm use 22 2>/dev/null; export PATH="$HOME/.claude/local:$HOME/.local/bin:$PATH"; exec ${program}`
   runTmux(['new-session', '-d', '-s', name, '-c', dir, '-x', '120', '-y', '40', '--', 'zsh', '-c', shellCmd])
   try { runTmux(['set-option', '-t', name, 'history-limit', '10000']) } catch {}
   try { runTmux(['set-option', '-t', name, 'status', 'off']) } catch {}
@@ -93,22 +93,57 @@ export async function startCCInstance(instance: CCInstance, workDir: string, com
   }
   createTmuxSession(instance.tmuxSessionName, workDir, command)
 
+  await Bun.sleep(1000)
+
   try {
     attachPipePane(instance.tmuxSessionName, instance.outputFilePath)
-    logger.info({ name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath, event: 'cc_pipe_pane_attached' })
+    logger.info('cc_pipe_pane_attached', { name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath })
   } catch (err) {
-    logger.warn({ name: instance.name, error: err instanceof Error ? err.message : String(err), event: 'cc_pipe_pane_attach_failed' })
+    logger.warn('cc_pipe_pane_attach_failed', { name: instance.name, error: err instanceof Error ? err.message : String(err) })
+    await Bun.sleep(2000)
+    try {
+      attachPipePane(instance.tmuxSessionName, instance.outputFilePath)
+      logger.info('cc_pipe_pane_attached_retry', { name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath })
+    } catch (retryErr) {
+      logger.warn('cc_pipe_pane_attach_retry_failed', { name: instance.name, error: retryErr instanceof Error ? retryErr.message : String(retryErr) })
+    }
   }
 
-  logger.info({ name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath, event: 'cc_instance_started' })
+  logger.info('cc_instance_started', { name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath })
 }
 
 export async function waitCCReady(instance: CCInstance, timeoutMs = 60000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let trustHandled = false
+  let unknownConsecutiveCount = 0
+  let pollAttempt = 0
+
+  await Bun.sleep(3000)
 
   while (Date.now() < deadline) {
-    refreshCCInstance(instance)
+    pollAttempt += 1
+    refreshCCInstance(instance, pollAttempt)
+
+    if (instance.status === 'unknown') {
+      unknownConsecutiveCount += 1
+      if (unknownConsecutiveCount > 10) {
+        try {
+          runTmux(['pipe-pane', '-t', instance.tmuxSessionName])
+          await Bun.sleep(500)
+          attachPipePane(instance.tmuxSessionName, instance.outputFilePath)
+          unknownConsecutiveCount = 0
+          logger.info('cc_pipe_pane_reattached_after_unknown', { name: instance.name })
+        } catch (reattachErr) {
+          logger.warn('cc_pipe_pane_reattach_failed', { name: instance.name, error: reattachErr instanceof Error ? reattachErr.message : String(reattachErr) })
+        }
+      }
+    } else {
+      unknownConsecutiveCount = 0
+    }
+
+    if (pollAttempt % 10 === 0) {
+      logger.info('cc_wait_ready_poll', { name: instance.name, status: instance.status, pollAttempt, elapsedMs: Date.now() - (deadline - timeoutMs) })
+    }
 
     if (instance.status === 'trust-prompt' && !trustHandled) {
       sendSpecialKey(instance.tmuxSessionName, 'Enter')
@@ -118,21 +153,40 @@ export async function waitCCReady(instance: CCInstance, timeoutMs = 60000): Prom
     }
 
     if (isIdleStatus(instance.status)) {
-      logger.info({ name: instance.name, status: instance.status }, 'CC instance ready')
+      logger.info('cc_instance_ready', { name: instance.name, status: instance.status })
       return
     }
     await Bun.sleep(500)
   }
+
+  const sessionExists = tmuxSessionExists(instance.tmuxSessionName)
+  const lastContentPreview = instance.content.slice(0, 200)
+  logger.error('cc_wait_ready_timeout', {
+    name: instance.name,
+    status: instance.status,
+    sessionExists,
+    lastContentPreview,
+    pollAttempt,
+  })
   throw new Error(`${instance.name}: timed out waiting for CC to become ready (last status: ${instance.status})`)
 }
 
-export function refreshCCInstance(instance: CCInstance): void {
+export function refreshCCInstance(instance: CCInstance, pollAttempt?: number): void {
   try {
     const content = capturePaneContent(instance.tmuxSessionName)
     instance.content = content
     instance.contentHash = createHash('sha256').update(content).digest('hex')
     instance.status = detectCCStatus(content)
-  } catch {
+    if (pollAttempt != null) {
+      if (pollAttempt % 5 === 0) {
+        logger.info('cc_refresh_poll', { name: instance.name, status: instance.status, pollAttempt })
+      } else {
+        logger.debug('cc_refresh_poll', { name: instance.name, status: instance.status, pollAttempt })
+      }
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
+    logger.warn('cc_capture_pane_failed', { name: instance.name, error: errMsg, pollAttempt })
     instance.status = 'unknown'
   }
 }
@@ -140,7 +194,7 @@ export function refreshCCInstance(instance: CCInstance): void {
 export function stopCCInstance(instance: CCInstance): void {
   try { runTmux(['pipe-pane', '-t', instance.tmuxSessionName]) } catch {}
   killTmuxSession(instance.tmuxSessionName)
-  logger.info({ name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath, event: 'cc_instance_stopped' })
+  logger.info('cc_instance_stopped', { name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath })
 }
 
 export function sendInputToCCInstance(instance: CCInstance, text: string): void {

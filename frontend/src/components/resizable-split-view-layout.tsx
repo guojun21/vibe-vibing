@@ -1,12 +1,10 @@
 /**
  * SplitView — VSCode-style resizable layout via native CSS + drag.
  * Left: DA chat panel. Right: CC terminal panels stacked vertically.
- * DA transparently forwards user input to all CC tmux sessions.
  */
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { Session } from '@shared/shared-message-and-session-types'
 import TerminalInstance from './terminal-instance-with-independent-websocket'
-import type { TerminalInstanceHandle } from './terminal-instance-with-independent-websocket'
 import DAPanel from './delegate-agent-chat-panel'
 
 interface Props {
@@ -84,22 +82,6 @@ export default function SplitView({ pinnedSessions, sendMessage }: Props) {
     0.45
   )
 
-  const termRefs = useRef<Map<string, TerminalInstanceHandle>>(new Map())
-
-  const setTermRef = useCallback((sessionId: string) => (handle: TerminalInstanceHandle | null) => {
-    if (handle) {
-      termRefs.current.set(sessionId, handle)
-    } else {
-      termRefs.current.delete(sessionId)
-    }
-  }, [])
-
-  const handleSendToAll = useCallback((text: string) => {
-    termRefs.current.forEach((handle) => {
-      handle.sendText(text)
-    })
-  }, [])
-
   if (pinnedSessions.length === 0) {
     return (
       <div className="flex items-center justify-center h-full text-white/30 text-sm">
@@ -115,7 +97,7 @@ export default function SplitView({ pinnedSessions, sendMessage }: Props) {
     <div ref={containerRef} className="flex h-full w-full min-h-0 overflow-hidden">
       {/* Left: DA Panel */}
       <div style={{ width: leftPct, minWidth: 200 }} className="shrink-0 h-full min-h-0 overflow-hidden">
-        <DAPanel onSendToAll={handleSendToAll} sendMessage={sendMessage} />
+        <DAPanel sendMessage={sendMessage} />
       </div>
 
       <HorizontalHandle onMouseDown={hDrag} />
@@ -126,7 +108,7 @@ export default function SplitView({ pinnedSessions, sendMessage }: Props) {
           <Fragment key={session.id}>
             {i > 0 && <div className="h-1 shrink-0 bg-white/5" />}
             <div className="flex-1 min-h-0 overflow-hidden">
-              <TerminalInstance ref={setTermRef(session.id)} session={session} />
+              <TerminalInstance session={session} />
             </div>
           </Fragment>
         ))}

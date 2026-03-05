@@ -21,11 +21,17 @@ export interface Team {
   }
 }
 
+export interface TeamCCSession {
+  name: string
+  tmuxSessionName: string
+}
+
 export interface TeamRuntimeStatus {
   teamId: string
   isRunning: boolean
   ccStatuses: Record<string, string>
   daSessionId: string | null
+  ccSessions?: TeamCCSession[]
 }
 
 export interface DAMessage {

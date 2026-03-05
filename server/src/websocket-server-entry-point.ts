@@ -52,7 +52,7 @@ import { normalizePaneStartCommand } from './agent-type-detection-from-process'
 import { generateSessionName } from './random-session-name-generator'
 import { shellQuote } from './shell-argument-escaping'
 import { SshTerminalProxy } from './terminal/ssh-remote-terminal-proxy'
-import { connectMongoDB, closeMongoDB } from './database/mongodb-connection'
+import { connectMongoDB, closeMongoDB, isMongoDBConnected } from './database/mongodb-connection'
 import * as teamRepo from './database/team-repository'
 import { startTeam, stopTeam, sendDAInput, getDAHistory, getActiveTeam, getAllActiveTeams, abortAgentLoop } from './team-lifecycle-service'
 import type { DAToolCallInfo, DAToolResultInfo } from './shared/shared-message-and-session-types'
@@ -838,7 +838,40 @@ app.post('/api/client-log', async (c) => {
   return c.json({ ok: true })
 })
 
-app.get('/api/health', (c) => c.json({ ok: true }))
+app.get('/api/health', async (c) => {
+  const mongoOk = await isMongoDBConnected()
+  let thalamusOk = false
+  try {
+    const r = await fetch(`${process.env.THALAMUS_URL || 'http://localhost:3013'}/v1/models`, { signal: AbortSignal.timeout(3000) })
+    thalamusOk = r.ok
+  } catch {}
+  return c.json({ ok: mongoOk && thalamusOk, mongo: mongoOk, thalamus: thalamusOk })
+})
+app.get('/api/devlog/files', async (c) => {
+  const devLogDir = path.resolve(import.meta.dir, '../../devLog')
+  try {
+    const entries = await Array.fromAsync(new Bun.Glob('*.md').scan({ cwd: devLogDir }))
+    const files = entries.sort().map((name) => ({ name: name.replace('.md', ''), path: name }))
+    return c.json({ files })
+  } catch {
+    return c.json({ files: [] })
+  }
+})
+
+app.get('/api/devlog/content', async (c) => {
+  const filePath = c.req.query('path')
+  if (!filePath || filePath.includes('..')) {
+    return c.json({ error: 'Invalid path' }, 400)
+  }
+  const fullPath = path.resolve(import.meta.dir, '../../devLog', filePath)
+  try {
+    const content = await Bun.file(fullPath).text()
+    return c.json({ content })
+  } catch {
+    return c.json({ error: 'File not found' }, 404)
+  }
+})
+
 app.get('/api/sessions', (c) => c.json(registry.getAll()))
 
 app.get('/api/session-preview/:sessionId', async (c) => {
@@ -1199,6 +1232,16 @@ Bun.serve<WSData>({
         try {
           const teams = await teamRepo.listAllTeams()
           send(ws, { type: 'teams', teams: teams.map(t => ({ teamId: t.teamId, name: t.name, createdAt: t.createdAt.toISOString(), updatedAt: t.updatedAt.toISOString(), status: t.status, config: t.config })) } as any)
+          for (const runtime of getAllActiveTeams()) {
+            const statuses: Record<string, string> = {}
+            const ccOutputFiles: Record<string, string> = {}
+            for (const inst of runtime.ccInstances) {
+              statuses[inst.name] = inst.status
+              ccOutputFiles[inst.name] = inst.outputFilePath
+            }
+            const ccSessions = runtime.ccInstances.map(inst => ({ name: inst.name, tmuxSessionName: inst.tmuxSessionName }))
+            send(ws, { type: 'team-status', status: { teamId: runtime.teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles, ccSessions } } as any)
+          }
         } catch {}
       })()
     },
@@ -1389,6 +1432,9 @@ function handleMessage(
       return
     case 'da-history-request':
       fireAndForget(handleDAHistoryRequest(message as any, ws), 'handleDAHistoryRequest')
+      return
+    case 'team-select':
+      // Client-side only; acknowledge without error
       return
     default:
       send(ws, { type: 'error', message: 'Unknown message type' })
@@ -2565,7 +2611,9 @@ async function handleTeamStart(message: { teamId: string }, ws: ServerWebSocket<
       statuses[inst.name] = inst.status
       ccOutputFiles[inst.name] = inst.outputFilePath
     }
-    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles } } as any)
+    const ccSessions = runtime.ccInstances.map(inst => ({ name: inst.name, tmuxSessionName: inst.tmuxSessionName }))
+    broadcast({ type: 'team-started', teamId: message.teamId, ccCount: runtime.ccInstances.length, daSessionId: runtime.daSessionId, ccSessions } as any)
+    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles, ccSessions } } as any)
     logger.info({ reqId, teamId: message.teamId, ccCount: runtime.ccInstances.length, daSessionId: runtime.daSessionId, ccStatuses: statuses, latencyMs: Date.now() - startMs, event: 'team_start_success' })
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
@@ -2580,7 +2628,7 @@ async function handleTeamStop(message: { teamId: string }, ws: ServerWebSocket<W
   logger.info({ reqId, teamId: message.teamId, event: 'team_stop_begin' })
   try {
     await stopTeam(message.teamId)
-    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: false, ccStatuses: {}, daSessionId: null } } as any)
+    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: false, ccStatuses: {}, daSessionId: null, ccSessions: [] } } as any)
     logger.info({ reqId, teamId: message.teamId, latencyMs: Date.now() - startMs, event: 'team_stop_success' })
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
@@ -2616,7 +2664,8 @@ async function handleDAInputMessage(message: { teamId: string; text: string }, w
         statuses[inst.name] = inst.status
         ccOutputFiles[inst.name] = inst.outputFilePath
       }
-      broadcast({ type: 'team-status', status: { teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles } } as any)
+      const ccSessions = runtime.ccInstances.map(inst => ({ name: inst.name, tmuxSessionName: inst.tmuxSessionName }))
+      broadcast({ type: 'team-status', status: { teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles, ccSessions } } as any)
       logger.info({ reqId, teamId, ccCount: runtime.ccInstances.length, event: 'da_input_auto_start_success' })
     } catch (startErr) {
       const errMsg = startErr instanceof Error ? startErr.message : String(startErr)

@@ -71,13 +71,22 @@ export class SessionManager {
     this.mouseMode = mouseMode
   }
 
+  private static globalStatusDisabled = false
+
   ensureSession(): void {
+    if (!SessionManager.globalStatusDisabled) {
+      try {
+        this.runTmux(['set-option', '-g', 'status', 'off'])
+        SessionManager.globalStatusDisabled = true
+      } catch {
+        // tmux may not be running yet
+      }
+    }
     try {
       this.runTmux(['has-session', '-t', this.sessionName])
     } catch {
       this.runTmux(['new-session', '-d', '-s', this.sessionName])
     }
-    // Hide tmux status bar — the web UI provides its own chrome.
     try { this.runTmux(['set-option', '-t', this.sessionName, 'status', 'off']) } catch {}
     // Disable prefix key so Ctrl+B isn't intercepted by tmux.
     try { this.runTmux(['set-option', '-t', this.sessionName, 'prefix', 'None']) } catch {}

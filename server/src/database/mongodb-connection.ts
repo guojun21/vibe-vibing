@@ -12,7 +12,7 @@ export async function connectMongoDB(): Promise<Db> {
   client = new MongoClient(MONGODB_URI)
   await client.connect()
   db = client.db(MONGODB_DB_NAME)
-  logger.info({ uri: MONGODB_URI, database: MONGODB_DB_NAME }, 'MongoDB connected')
+  logger.info('mongodb_connected', { uri: MONGODB_URI, database: MONGODB_DB_NAME })
   await ensureIndexes(db)
   return db
 }
@@ -22,12 +22,27 @@ export function getDb(): Db {
   return db
 }
 
+export async function isMongoDBConnected(): Promise<boolean> {
+  if (!db) return false
+  try {
+    await Promise.race([
+      db.admin().ping(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('ping timeout')), 2000)
+      ),
+    ])
+    return true
+  } catch {
+    return false
+  }
+}
+
 export async function closeMongoDB(): Promise<void> {
   if (client) {
     await client.close()
     client = null
     db = null
-    logger.info('MongoDB disconnected')
+    logger.info('mongodb_disconnected')
   }
 }
 
@@ -41,5 +56,5 @@ async function ensureIndexes(database: Db): Promise<void> {
   await database.collection('messages').createIndex({ sessionId: 1, timestamp: 1 })
   await database.collection('cc_snapshots').createIndex({ sessionId: 1, capturedAt: -1 })
   await database.collection('cc_snapshots').createIndex({ teamId: 1 })
-  logger.info('MongoDB indexes ensured')
+  logger.info('mongodb_indexes_ensured')
 }

@@ -1,7 +1,7 @@
 import { logger } from './structured-pino-logger'
 
 const THALAMUS_BASE_URL = process.env.THALAMUS_URL || 'http://localhost:3013'
-const THALAMUS_MODEL = process.env.THALAMUS_MODEL || 'claude-sonnet-4-20250514'
+const THALAMUS_MODEL = process.env.THALAMUS_MODEL || 'grok-code-fast-1'
 const THALAMUS_API_KEY = process.env.THALAMUS_API_KEY || 'sk-placeholder'
 
 export interface ChatMessage {
@@ -44,12 +44,10 @@ export async function callThalamus(
   const reqId = `tlm_${crypto.randomUUID().slice(0, 8)}`
   const selectedModel = model || THALAMUS_MODEL
 
-  logger.info('thalamus_request_start', {
-    reqId,
-    model: selectedModel,
-    messageCount: messages.length,
-    toolCount: tools.length,
-  })
+  const systemPromptLen =
+    messages.length > 0 && messages[0].role === 'system'
+      ? (messages[0].content ?? '').length
+      : undefined
 
   const body = {
     model: selectedModel,
@@ -65,20 +63,49 @@ export async function callThalamus(
     stream: false,
   }
 
-  const resp = await fetch(`${THALAMUS_BASE_URL}/v1/chat/completions`, {
+  const requestUrl = `${THALAMUS_BASE_URL}/v1/chat/completions`
+  const bodyPreview = JSON.stringify(body).slice(0, 200)
+
+  logger.info('thalamus_request_start', {
+    reqId,
+    model: selectedModel,
+    messageCount: messages.length,
+    toolCount: tools.length,
+    systemPromptLen,
+    bodyPreview,
+    requestUrl,
+  })
+
+  const resp = await fetch(requestUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${THALAMUS_API_KEY}`,
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(120_000),
   })
+
+  const respStatus = resp.status
+  const respContentType = resp.headers.get('content-type') ?? undefined
 
   if (!resp.ok) {
     const errorText = await resp.text()
-    logger.error('thalamus_request_error', { reqId, status: resp.status, error: errorText, latencyMs: Date.now() - startMs })
-    throw new Error(`Thalamus API error ${resp.status}: ${errorText}`)
+    logger.error('thalamus_request_error', {
+      reqId,
+      status: respStatus,
+      contentType: respContentType,
+      error: errorText,
+      latencyMs: Date.now() - startMs,
+    })
+    throw new Error(`Thalamus API error ${respStatus}: ${errorText}`)
   }
+
+  logger.debug('thalamus_response', {
+    reqId,
+    status: respStatus,
+    contentType: respContentType,
+  })
 
   const data = await resp.json() as any
 
@@ -103,6 +130,8 @@ export async function callThalamus(
 
   logger.info('thalamus_request_done', {
     reqId,
+    status: respStatus,
+    contentType: respContentType,
     finishReason: result.finishReason,
     toolCallCount: assistantMsg.tool_calls?.length ?? 0,
     contentLen: (assistantMsg.content || '').length,

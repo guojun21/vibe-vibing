@@ -8,7 +8,6 @@ import {
 } from '../stores/team-state-store'
 
 interface DAPanelProps {
-  onSendToAll: (text: string) => void
   sendMessage?: (message: any) => void
   teamId?: string | null
 }
@@ -138,7 +137,7 @@ function AgentEventBlock({ event }: { event: DAAgentEvent }) {
   return null
 }
 
-export default function DAPanel({ onSendToAll, sendMessage, teamId }: DAPanelProps) {
+export default function DAPanel({ sendMessage, teamId }: DAPanelProps) {
   const { selectedTeamId, daMessages, daAgentEvents, daAgentRunning, clearDAAgentEvents } = useTeamStore()
   const activeTeamId = teamId ?? selectedTeamId
   const teamMessages = activeTeamId ? (daMessages[activeTeamId] || []) : []
@@ -160,11 +159,13 @@ export default function DAPanel({ onSendToAll, sendMessage, teamId }: DAPanelPro
       clearDAAgentEvents(activeTeamId)
     }
     if (sendMessage && activeTeamId) {
+      if (import.meta.env.DEV) {
+        console.log('[da-input] teamId:', activeTeamId, 'text:', text)
+      }
       sendMessage({ type: 'da-input', teamId: activeTeamId, text })
     }
-    onSendToAll(text)
     setInput('')
-  }, [input, onSendToAll, sendMessage, activeTeamId, clearDAAgentEvents])
+  }, [input, sendMessage, activeTeamId, clearDAAgentEvents])
 
   return (
     <div data-testid="da-panel" className="flex flex-col h-full bg-terminal overflow-hidden rounded-lg border border-white/5">
@@ -214,7 +215,9 @@ export default function DAPanel({ onSendToAll, sendMessage, teamId }: DAPanelPro
           <div className="flex flex-col">
             <span className="text-[11px] font-semibold mb-0.5 text-green-400">DA</span>
             <span className="text-[13px] text-white/75 leading-relaxed whitespace-pre-wrap">
-              DA Agent ready. Type an instruction and press Enter. I will plan, dispatch to CCs, and report back.
+              {!activeTeamId
+                ? 'Select a team and send a message to start the DA agent.'
+                : 'DA Agent ready. Type an instruction and press Enter. I will plan, dispatch to CCs, and report back.'}
             </span>
           </div>
         )}
@@ -223,6 +226,12 @@ export default function DAPanel({ onSendToAll, sendMessage, teamId }: DAPanelPro
       </div>
 
       <div data-testid="da-panel-input-area" className="p-2 border-t border-white/5 bg-black/20 shrink-0">
+        {isRunning && (
+          <div className="flex items-center gap-1.5 mb-2 text-[11px] text-yellow-400/80">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse" />
+            <span>Thinking...</span>
+          </div>
+        )}
         <div className="flex gap-2">
           <input
             data-testid="da-input"

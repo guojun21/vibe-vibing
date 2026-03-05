@@ -129,7 +129,7 @@
 html,
 body {
   height: 100%;
-  height: 100dvh; /* Dynamic viewport height for mobile keyboard */
+  height: 100dvh;
   margin: 0;
   overflow: hidden;
   font-family: "JetBrains Mono Variable", "JetBrains Mono", "SF Mono", "Fira Code", ui-monospace, monospace;
@@ -312,7 +312,7 @@ body {
 /* Terminal styles */
 .xterm {
   font-family: "JetBrains Mono Variable", "JetBrains Mono", "SF Mono", "Fira Code", ui-monospace, monospace;
-  padding: 8px;
+  padding: 4px 8px;
 }
 
 .ios-native-term-selection .xterm .xterm-accessibility-tree {

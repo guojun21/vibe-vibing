@@ -149,6 +149,12 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: path.resolve(__dirname, '..', 'dist', 'client'),
       emptyOutDir: true,
+      rollupOptions: {
+        input: {
+          main: path.resolve(__dirname, 'index.html'),
+          devlog: path.resolve(__dirname, 'devlog.html'),
+        },
+      },
     },
   }
 })

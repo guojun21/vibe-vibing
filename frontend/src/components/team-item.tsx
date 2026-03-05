@@ -12,7 +12,7 @@ interface TeamItemProps {
 
 export function TeamItem({ team, isSelected, status, onSelect, onStart, onStop, onDelete }: TeamItemProps) {
   const isRunning = status?.isRunning ?? false
-  const ccCount = team.config.members.length
+  const ccCount = team.config?.members?.length ?? team.config?.ccCount ?? 0
 
   return (
     <div
@@ -34,20 +34,33 @@ export function TeamItem({ team, isSelected, status, onSelect, onStart, onStop, 
             className={`w-2 h-2 rounded-full shrink-0 ${isRunning ? 'bg-green-500' : 'bg-white/20'}`}
           />
           <span data-testid={`team-name-${team.teamId}`} className="text-sm truncate">{team.name}</span>
+          {isRunning && (
+            <span
+              data-testid={`team-running-badge-${team.teamId}`}
+              className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-green-900/40 text-green-400 font-medium"
+            >
+              Running
+            </span>
+          )}
         </div>
-        <span data-testid={`team-cc-count-${team.teamId}`} className="text-[10px] text-white/40 shrink-0 ml-2">
-          {ccCount} CC
-        </span>
+        <div className="flex items-center gap-1.5 shrink-0 ml-2">
+          {team.status === 'archived' && (
+            <span className="text-[9px] px-1 py-0.5 rounded bg-white/10 text-white/40">Archived</span>
+          )}
+          <span data-testid={`team-cc-count-${team.teamId}`} className="text-[10px] text-white/40">
+            {ccCount} CC
+          </span>
+        </div>
       </div>
 
       {isSelected && (
-        <div data-testid={`team-actions-${team.teamId}`} className="flex gap-1 mt-1.5 ml-4">
+        <div data-testid={`team-actions-${team.teamId}`} className="flex gap-2 mt-1.5 ml-4">
           {!isRunning ? (
             <button
               data-testid={`team-start-${team.teamId}`}
               aria-label={`Start team ${team.name}`}
               onClick={(e) => { e.stopPropagation(); onStart() }}
-              className="px-2 py-0.5 text-[10px] rounded bg-green-700/50 hover:bg-green-600/50 text-green-300"
+              className="px-3 py-1 text-xs font-medium rounded-md bg-green-600 hover:bg-green-500 text-white transition-colors"
             >
               Start
             </button>
@@ -56,7 +69,7 @@ export function TeamItem({ team, isSelected, status, onSelect, onStart, onStop, 
               data-testid={`team-stop-${team.teamId}`}
               aria-label={`Stop team ${team.name}`}
               onClick={(e) => { e.stopPropagation(); onStop() }}
-              className="px-2 py-0.5 text-[10px] rounded bg-red-700/50 hover:bg-red-600/50 text-red-300"
+              className="px-3 py-1 text-xs font-medium rounded-md bg-red-600 hover:bg-red-500 text-white transition-colors"
             >
               Stop
             </button>
@@ -65,7 +78,7 @@ export function TeamItem({ team, isSelected, status, onSelect, onStart, onStop, 
             data-testid={`team-delete-${team.teamId}`}
             aria-label={`Delete team ${team.name}`}
             onClick={(e) => { e.stopPropagation(); onDelete() }}
-            className="px-2 py-0.5 text-[10px] rounded bg-white/5 hover:bg-white/10 text-white/40"
+            className="px-2 py-1 text-[10px] rounded bg-white/5 hover:bg-white/10 text-white/40"
           >
             Delete
           </button>
