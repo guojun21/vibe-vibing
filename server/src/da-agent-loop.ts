@@ -87,6 +87,20 @@ export async function runAgentLoop(
       }
 
       if (response.finishReason !== 'tool_calls' || !response.message.tool_calls?.length) {
+        if (step === 0) {
+          logger.warn('da_agent_no_tools_step0', {
+            teamId, loopId, finishReason: response.finishReason,
+            contentPreview: (response.message.content || '').slice(0, 100),
+          })
+          messages.push({
+            role: 'user',
+            content:
+              'You MUST use your tools. Start by calling get_all_cc_status to check worker availability, ' +
+              'then dispatch the task using send_to_cc. Do NOT reply without using tools first.',
+          })
+          continue
+        }
+
         const summary = response.message.content || '(no response)'
         logger.info('da_agent_loop_done', {
           teamId,

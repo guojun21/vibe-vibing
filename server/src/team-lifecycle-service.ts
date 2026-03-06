@@ -56,13 +56,23 @@ export async function startTeam(
     throw new Error(`Team ${teamId} not found`)
   }
 
-  logger.info({ teamId, teamName: team.name, memberCount: team.config.members.length, defaultProjectPath: team.config.defaultProjectPath, event: 'team_lifecycle_config_loaded' })
+  const members = team.config.members ?? Array.from(
+    { length: team.config.ccCount || 1 },
+    (_, i) => ({
+      name: `agent-${i + 1}`,
+      agentType: 'claude-code' as const,
+      command: 'claude',
+      projectPath: team.config.defaultProjectPath,
+    }),
+  )
+
+  logger.info('team_lifecycle_config_loaded', { teamId, teamName: team.name, memberCount: members.length, defaultProjectPath: team.config.defaultProjectPath })
 
   const ccInstances: CCInstance[] = []
   const ccSessionIds = new Map<string, string>()
 
-  for (let i = 0; i < team.config.members.length; i++) {
-    const member = team.config.members[i]
+  for (let i = 0; i < members.length; i++) {
+    const member = members[i]
     const tmuxName = `${teamId.slice(0, 8)}-cc-${i}`
     const command = member.command || (member.agentType === 'codex' ? 'codex' : 'claude')
     const projectPath = member.projectPath || team.config.defaultProjectPath
