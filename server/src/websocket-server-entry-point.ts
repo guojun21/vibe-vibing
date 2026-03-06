@@ -2654,6 +2654,7 @@ async function handleTeamStart(message: { teamId: string }, ws: ServerWebSocket<
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
     logger.error({ reqId, teamId: message.teamId, error: errMsg, stack: err instanceof Error ? err.stack : undefined, latencyMs: Date.now() - startMs, event: 'team_start_error' })
+    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: false, ccStatuses: {}, daSessionId: null, ccOutputFiles: {}, ccSessions: [], startup: null } } as any)
     send(ws, { type: 'error', message: errMsg })
   }
 }
@@ -2709,6 +2710,7 @@ async function handleDAInputMessage(message: { teamId: string; text: string }, w
     } catch (startErr) {
       const errMsg = startErr instanceof Error ? startErr.message : String(startErr)
       logger.error({ reqId, teamId, error: errMsg, event: 'da_input_auto_start_failed' })
+      broadcast({ type: 'team-status', status: { teamId, isRunning: false, ccStatuses: {}, daSessionId: null, ccOutputFiles: {}, ccSessions: [], startup: null } } as any)
       send(ws, { type: 'error', message: `Failed to auto-start team: ${errMsg}` })
       return
     }
