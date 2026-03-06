@@ -54,6 +54,7 @@ import { shellQuote } from './shell-argument-escaping'
 import { SshTerminalProxy } from './terminal/ssh-remote-terminal-proxy'
 import { connectMongoDB, closeMongoDB, isMongoDBConnected } from './database/mongodb-connection'
 import * as teamRepo from './database/team-repository'
+import * as sessionRepo from './database/session-repository'
 import { startTeam, stopTeam, sendDAInput, getDAHistory, getActiveTeam, getAllActiveTeams, abortAgentLoop } from './team-lifecycle-service'
 import type { DAToolCallInfo, DAToolResultInfo } from './shared/shared-message-and-session-types'
 
@@ -661,6 +662,35 @@ function hydrateSessionsWithAgentSessions(
   return hydrated
 }
 
+async function hydrateSessionsWithTeamInfo(sessions: Session[]): Promise<Session[]> {
+  try {
+    const [sessionDocs, teams] = await Promise.all([
+      sessionRepo.getAllSessions(),
+      teamRepo.listAllTeams(),
+    ])
+    if (sessionDocs.length === 0) return sessions
+
+    const teamNameMap = new Map(teams.map(t => [t.teamId, t.name]))
+    const tmuxToTeam = new Map<string, { teamId: string; teamName: string }>()
+    for (const doc of sessionDocs) {
+      const teamName = teamNameMap.get(doc.teamId)
+      if (teamName) {
+        tmuxToTeam.set(doc.tmuxSessionName, { teamId: doc.teamId, teamName })
+      }
+    }
+
+    return sessions.map(session => {
+      const tmuxSession = session.tmuxWindow.split(':')[0]
+      const teamInfo = tmuxToTeam.get(tmuxSession)
+      if (!teamInfo) return session
+      return { ...session, teamId: teamInfo.teamId, teamName: teamInfo.teamName }
+    })
+  } catch (err) {
+    logger.warn('team_hydration_error', { error: String(err) })
+    return sessions
+  }
+}
+
 let refreshInFlight = false
 
 async function refreshSessionsAsync(): Promise<void> {
@@ -672,7 +702,8 @@ async function refreshSessionsAsync(): Promise<void> {
       config.discoverPrefixes
     )
     const hydrated = hydrateSessionsWithAgentSessions(sessions)
-    const withOverrides = applyForceWorkingOverrides(hydrated)
+    const withTeams = await hydrateSessionsWithTeamInfo(hydrated)
+    const withOverrides = applyForceWorkingOverrides(withTeams)
     registry.replaceSessions(mergeRemoteSessions(withOverrides))
   } catch (error) {
     // Fallback to sync on worker failure
@@ -681,7 +712,8 @@ async function refreshSessionsAsync(): Promise<void> {
     })
     const sessions = sessionManager.listWindows()
     const hydrated = hydrateSessionsWithAgentSessions(sessions)
-    const withOverrides = applyForceWorkingOverrides(hydrated)
+    const withTeams = await hydrateSessionsWithTeamInfo(hydrated)
+    const withOverrides = applyForceWorkingOverrides(withTeams)
     registry.replaceSessions(mergeRemoteSessions(withOverrides))
   } finally {
     refreshInFlight = false
@@ -693,10 +725,11 @@ function refreshSessions() {
 }
 
 // Sync version for startup - ensures sessions are ready before server starts
-function refreshSessionsSync({ verifyAssociations = false } = {}) {
+async function refreshSessionsSync({ verifyAssociations = false } = {}) {
   const sessions = sessionManager.listWindows()
   const hydrated = hydrateSessionsWithAgentSessions(sessions, { verifyAssociations })
-  registry.replaceSessions(mergeRemoteSessions(hydrated))
+  const withTeams = await hydrateSessionsWithTeamInfo(hydrated)
+  registry.replaceSessions(mergeRemoteSessions(withTeams))
 }
 
 // Debounced refresh triggered by Enter key in terminal input
@@ -776,7 +809,7 @@ logger.info('startup_state', {
   })),
 })
 
-refreshSessionsSync() // hydrate from persisted associations without verification
+await refreshSessionsSync() // hydrate from persisted associations without verification
 setInterval(refreshSessions, config.refreshIntervalMs) // Async for periodic
 
 async function completeStartupVerification(): Promise<void> {
@@ -807,7 +840,7 @@ async function completeStartupVerification(): Promise<void> {
 
   if (db.getPinnedOrphaned().length > 0) {
     resurrectPinnedSessions()
-    refreshSessionsSync()
+    await refreshSessionsSync()
   }
 }
 
@@ -1733,7 +1766,7 @@ async function handleRename(
 ) {
   let session = registry.get(sessionId)
   if (!session) {
-    refreshSessionsSync() // Use sync for inline operations needing immediate results
+    await refreshSessionsSync()
     session = registry.get(sessionId)
     if (!session) {
       send(ws, { type: 'error', message: 'Session not found' })

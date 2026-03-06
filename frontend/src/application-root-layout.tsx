@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ServerMessage } from '@shared/shared-message-and-session-types'
 import Header from './components/application-header-bar'
-import SessionList from './components/session-list-sidebar'
 import Terminal from './components/single-session-terminal-view'
 import TeamView from './components/team-view'
 import { TeamSidebar } from './components/team-sidebar'
@@ -645,17 +644,16 @@ export default function App() {
           onOpenSettings={handleOpenSettings}
           tailscaleIp={serverInfo?.tailscaleIp ?? null}
         />
-        <TeamSidebar sendMessage={sendMessage} />
-        <div className="h-px shrink-0 bg-white/10" />
-        <SessionList
+        <TeamSidebar
+          sendMessage={sendMessage}
           sessions={sessions}
           inactiveSessions={agentSessions.inactive}
           selectedSessionId={selectedSessionId}
-          onSelect={setSelectedSessionId}
-          onRename={handleRenameSession}
-          onResume={handleResumeSession}
-          onKill={handleKillSession}
-          onDuplicate={handleDuplicateSession}
+          onSelectSession={setSelectedSessionId}
+          onRenameSession={handleRenameSession}
+          onResumeSession={handleResumeSession}
+          onKillSession={handleKillSession}
+          onDuplicateSession={handleDuplicateSession}
           onSetPinned={handleSetPinned}
           loading={!hasLoaded}
           error={connectionError || serverError}

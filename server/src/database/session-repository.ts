@@ -85,6 +85,11 @@ export async function deleteSessionsByTeam(teamId: string): Promise<void> {
   }
 }
 
+export async function getAllSessions(): Promise<SessionDocument[]> {
+  if (isMongoAvailable()) return collection().find().toArray()
+  return [...memoryStore.values()]
+}
+
 export async function getDASession(teamId: string): Promise<SessionDocument | null> {
   if (isMongoAvailable()) return collection().findOne({ teamId, role: 'da' })
   return [...memoryStore.values()].find(s => s.teamId === teamId && s.role === 'da') ?? null

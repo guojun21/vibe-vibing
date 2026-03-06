@@ -33,6 +33,8 @@ export interface Session {
   logFilePath?: string
   lastUserMessage?: string
   isPinned?: boolean
+  teamId?: string
+  teamName?: string
 }
 
 export interface AgentSession {
