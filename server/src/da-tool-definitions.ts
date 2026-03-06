@@ -102,4 +102,37 @@ export const DA_TOOL_DEFINITIONS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'query_conversation_history',
+      description:
+        'Query earlier conversation history for this team. ' +
+        'Returns past user requests and DA responses from previous rounds. ' +
+        'Use this when you need details from conversations older than what is in your context window. ' +
+        'Your current context already contains recent rounds and summaries of older ones.',
+      parameters: {
+        type: 'object',
+        properties: {
+          round_start: {
+            type: 'number',
+            description: 'Start round number (inclusive)',
+          },
+          round_end: {
+            type: 'number',
+            description: 'End round number (inclusive)',
+          },
+          keyword: {
+            type: 'string',
+            description: 'Optional keyword to filter results by content',
+          },
+          include_tool_details: {
+            type: 'boolean',
+            description: 'Include tool_call/tool_result details. Default false (only user_input + complete).',
+          },
+        },
+        required: ['round_start', 'round_end'],
+      },
+    },
+  },
 ]

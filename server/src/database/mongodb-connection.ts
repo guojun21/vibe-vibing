@@ -56,5 +56,13 @@ async function ensureIndexes(database: Db): Promise<void> {
   await database.collection('messages').createIndex({ sessionId: 1, timestamp: 1 })
   await database.collection('cc_snapshots').createIndex({ sessionId: 1, capturedAt: -1 })
   await database.collection('cc_snapshots').createIndex({ teamId: 1 })
+
+  await database.collection('da_transcripts').createIndex({ teamId: 1, roundNumber: 1, step: 1 })
+  await database.collection('da_transcripts').createIndex({ teamId: 1, timestamp: -1 })
+  await database.collection('da_transcripts').createIndex({ loopId: 1, step: 1 })
+  await database.collection('da_conversation_summaries').createIndex({ teamId: 1, paragraphIndex: 1 }, { unique: true })
+  await database.collection('da_conversation_summaries').createIndex({ teamId: 1, roundStart: 1 })
+  await database.collection('da_round_counters').createIndex({ teamId: 1 }, { unique: true })
+
   logger.info('mongodb_indexes_ensured')
 }

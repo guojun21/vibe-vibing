@@ -4,6 +4,7 @@ export function buildDASystemPrompt(
   teamName: string,
   projectPath: string,
   ccInstances: CCInstance[],
+  conversationContext?: string,
 ): string {
   const ccList = ccInstances
     .map((cc, i) => `  - "${cc.name}" (type: ${cc.agentType}, tmux: ${cc.tmuxSessionName})`)
@@ -65,5 +66,11 @@ Before dispatching, output your plan as:
 After all tool calls are complete, provide a structured summary:
 - What was requested
 - What each CC did
-- Results and any issues encountered`
+- Results and any issues encountered
+
+## Conversation Memory
+
+You have access to your conversation history via the \`query_conversation_history\` tool.
+Your context already includes summaries of older conversations and recent full exchanges.
+Use the tool to retrieve specific details from earlier rounds when needed.${conversationContext ? `\n\n## Conversation History\n\n${conversationContext}` : ''}`
 }

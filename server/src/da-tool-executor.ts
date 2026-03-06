@@ -8,6 +8,7 @@ import {
 } from './cc-instance-manager'
 import { isIdleStatus } from './cc-status-detector'
 import { logger } from './structured-pino-logger'
+import { getTranscriptsByRoundRange } from './database/da-transcript-repository'
 
 export interface ToolResult {
   id: string
@@ -111,6 +112,79 @@ async function execBroadcast(
   return `Broadcast to ${runtime.ccInstances.length} CCs:\n${results.join('\n')}`
 }
 
+async function execQueryConversationHistory(
+  runtime: TeamRuntime,
+  args: { round_start: number; round_end: number; keyword?: string; include_tool_details?: boolean },
+): Promise<string> {
+  const startMs = Date.now()
+  const typesFilter = args.include_tool_details
+    ? undefined
+    : (['user_input', 'complete', 'error'] as const)
+
+  let events = await getTranscriptsByRoundRange(
+    runtime.teamId,
+    args.round_start,
+    args.round_end,
+    typesFilter as any,
+  )
+
+  if (args.keyword) {
+    const kw = args.keyword.toLowerCase()
+    events = events.filter((e) => {
+      if (e.content && e.content.toLowerCase().includes(kw)) return true
+      if (e.toolCalls?.some((tc) => tc.name.toLowerCase().includes(kw) || tc.arguments.toLowerCase().includes(kw))) return true
+      if (e.toolResults?.some((tr) => tr.output.toLowerCase().includes(kw))) return true
+      return false
+    })
+  }
+
+  logger.info('da_history_query', {
+    teamId: runtime.teamId,
+    roundStart: args.round_start,
+    roundEnd: args.round_end,
+    keyword: args.keyword,
+    includeToolDetails: args.include_tool_details ?? false,
+    resultCount: events.length,
+    latencyMs: Date.now() - startMs,
+  })
+
+  if (events.length === 0) {
+    return `No conversation history found for rounds ${args.round_start}-${args.round_end}${args.keyword ? ` with keyword "${args.keyword}"` : ''}.`
+  }
+
+  const lines: string[] = [`Conversation history (rounds ${args.round_start}-${args.round_end}):`]
+  for (const e of events) {
+    const prefix = `[Round ${e.roundNumber}]`
+    switch (e.type) {
+      case 'user_input':
+        lines.push(`${prefix} User: ${e.content}`)
+        break
+      case 'thinking':
+        lines.push(`${prefix} DA Thinking: ${(e.content ?? '').slice(0, 500)}`)
+        break
+      case 'tool_call':
+        for (const tc of e.toolCalls ?? []) {
+          lines.push(`${prefix} Tool: ${tc.name}(${tc.arguments.slice(0, 300)})`)
+        }
+        break
+      case 'tool_result':
+        for (const tr of e.toolResults ?? []) {
+          lines.push(`${prefix} Result [${tr.isError ? 'ERROR' : 'OK'}]: ${tr.name} → ${tr.output.slice(0, 300)}`)
+        }
+        break
+      case 'complete':
+        lines.push(`${prefix} DA: ${e.content}`)
+        break
+      case 'error':
+        lines.push(`${prefix} DA Error: ${e.content}`)
+        break
+    }
+  }
+
+  const output = lines.join('\n')
+  return output.length > 8000 ? output.slice(0, 8000) + '\n... (truncated)' : output
+}
+
 export async function executeToolCalls(
   toolCalls: ToolCall[],
   runtime: TeamRuntime,
@@ -146,6 +220,9 @@ export async function executeToolCalls(
             break
           case 'broadcast':
             output = await execBroadcast(runtime, args)
+            break
+          case 'query_conversation_history':
+            output = await execQueryConversationHistory(runtime, args)
             break
           default:
             output = `[ERROR] Unknown tool: ${name}`
