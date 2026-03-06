@@ -443,7 +443,7 @@ export default function SessionList({
   }
 
   return (
-    <aside className="flex min-h-0 flex-1 flex-col border-r border-border bg-elevated">
+    <aside className="flex min-h-0 flex-1 flex-col overflow-hidden border-r border-border bg-elevated">
       {error && (
         <div className="shrink-0 border-b border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
           {error}

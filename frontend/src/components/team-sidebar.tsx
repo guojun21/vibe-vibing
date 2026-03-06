@@ -49,7 +49,7 @@ export function TeamSidebar({ sendMessage }: TeamSidebarProps) {
   }, [selectedTeamId, activeTeams, selectTeam])
 
   return (
-    <div data-testid="team-sidebar" className="flex flex-col h-full bg-[#0d1117] text-white/80">
+    <div data-testid="team-sidebar" className="flex flex-col shrink-0 max-h-[40%] min-h-0 bg-[#0d1117] text-white/80">
       <div data-testid="team-sidebar-header" className="flex items-center justify-between px-3 py-2 border-b border-white/10">
         <span className="text-xs font-semibold uppercase tracking-wider text-white/50">Teams</span>
         <button

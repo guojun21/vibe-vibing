@@ -88,6 +88,11 @@ export interface TeamConfig {
   defaultProjectPath: string
 }
 
+export interface TeamCCSession {
+  name: string
+  tmuxSessionName: string
+}
+
 export interface Team {
   teamId: string
   name: string
@@ -97,11 +102,29 @@ export interface Team {
   config: TeamConfig
 }
 
+export type TeamStartupPhase =
+  | 'initializing'
+  | 'launching_cc'
+  | 'waiting_for_ready'
+  | 'creating_da'
+  | 'complete'
+
+export interface TeamStartupStatus {
+  phase: TeamStartupPhase
+  message: string
+  readyCount: number
+  totalCount: number
+  currentCCName?: string
+}
+
 export interface TeamRuntimeStatus {
   teamId: string
   isRunning: boolean
   ccStatuses: Record<string, string>
   daSessionId: string | null
+  ccSessions?: TeamCCSession[]
+  ccOutputFiles?: Record<string, string>
+  startup?: TeamStartupStatus | null
 }
 
 export interface DAMessage {
@@ -154,6 +177,7 @@ export type ServerMessage =
   | { type: 'teams'; teams: Team[] }
   | { type: 'team-created'; team: Team }
   | { type: 'team-updated'; team: Team }
+  | { type: 'team-started'; teamId: string; ccCount: number; daSessionId: string | null; ccSessions: TeamCCSession[] }
   | { type: 'team-status'; status: TeamRuntimeStatus }
   | { type: 'da-message'; teamId: string; message: DAMessage }
   | { type: 'da-history'; teamId: string; messages: DAMessage[] }

@@ -1,4 +1,5 @@
 import type { Team, TeamRuntimeStatus } from '../stores/team-state-store'
+import { isTeamStartupInProgress } from '../utils/team-startup-display'
 
 interface TeamItemProps {
   team: Team
@@ -12,6 +13,7 @@ interface TeamItemProps {
 
 export function TeamItem({ team, isSelected, status, onSelect, onStart, onStop, onDelete }: TeamItemProps) {
   const isRunning = status?.isRunning ?? false
+  const isStarting = isTeamStartupInProgress(status)
   const ccCount = team.config?.members?.length ?? team.config?.ccCount ?? 0
 
   return (
@@ -30,11 +32,23 @@ export function TeamItem({ team, isSelected, status, onSelect, onStart, onStop, 
         <div className="flex items-center gap-2 min-w-0">
           <div
             data-testid={`team-status-indicator-${team.teamId}`}
-            aria-label={isRunning ? 'Running' : 'Stopped'}
-            className={`w-2 h-2 rounded-full shrink-0 ${isRunning ? 'bg-green-500' : 'bg-white/20'}`}
+            aria-label={isStarting ? 'Starting' : isRunning ? 'Running' : 'Stopped'}
+            className={`w-2 h-2 rounded-full shrink-0 ${
+              isStarting ? 'bg-blue-400 animate-pulse'
+              : isRunning ? 'bg-green-500'
+              : 'bg-white/20'
+            }`}
           />
           <span data-testid={`team-name-${team.teamId}`} className="text-sm truncate">{team.name}</span>
-          {isRunning && (
+          {isStarting && (
+            <span
+              data-testid={`team-starting-badge-${team.teamId}`}
+              className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-blue-900/40 text-blue-400 font-medium"
+            >
+              Starting
+            </span>
+          )}
+          {isRunning && !isStarting && (
             <span
               data-testid={`team-running-badge-${team.teamId}`}
               className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-green-900/40 text-green-400 font-medium"
@@ -55,7 +69,15 @@ export function TeamItem({ team, isSelected, status, onSelect, onStart, onStop, 
 
       {isSelected && (
         <div data-testid={`team-actions-${team.teamId}`} className="flex gap-2 mt-1.5 ml-4">
-          {!isRunning ? (
+          {isStarting ? (
+            <button
+              data-testid={`team-start-${team.teamId}`}
+              disabled
+              className="px-3 py-1 text-xs font-medium rounded-md bg-blue-800/60 text-blue-300 cursor-not-allowed transition-colors"
+            >
+              Starting...
+            </button>
+          ) : !isRunning ? (
             <button
               data-testid={`team-start-${team.teamId}`}
               aria-label={`Start team ${team.name}`}
@@ -85,7 +107,7 @@ export function TeamItem({ team, isSelected, status, onSelect, onStart, onStop, 
         </div>
       )}
 
-      {isRunning && status && Object.keys(status.ccStatuses).length > 0 && (
+      {(isRunning || isStarting) && status && Object.keys(status.ccStatuses).length > 0 && (
         <div data-testid={`team-cc-statuses-${team.teamId}`} className="flex gap-1 mt-1 ml-4 flex-wrap">
           {Object.entries(status.ccStatuses).map(([name, ccStatus]) => (
             <span
@@ -97,7 +119,9 @@ export function TeamItem({ team, isSelected, status, onSelect, onStart, onStop, 
                   ? 'bg-green-900/30 text-green-400'
                   : ccStatus === 'processing'
                     ? 'bg-yellow-900/30 text-yellow-400'
-                    : 'bg-white/5 text-white/30'
+                    : ccStatus === 'starting' || ccStatus === 'queued'
+                      ? 'bg-blue-900/30 text-blue-400'
+                      : 'bg-white/5 text-white/30'
               }`}
             >
               {name}: {ccStatus}

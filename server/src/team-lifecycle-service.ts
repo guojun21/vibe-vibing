@@ -16,6 +16,11 @@ import * as teamRepo from './database/team-repository'
 import * as sessionRepo from './database/session-repository'
 import * as messageRepo from './database/message-repository'
 import { logger } from './structured-pino-logger'
+import {
+  buildRunningTeamStatus,
+  buildTeamStartupStatus,
+} from './team-runtime-status'
+import type { TeamRuntimeStatus } from './shared/shared-message-and-session-types'
 
 export interface TeamRuntime {
   teamId: string
@@ -41,6 +46,7 @@ export async function startTeam(
   teamId: string,
   onStatusUpdate?: (teamId: string, statuses: Record<string, string>) => void,
   onAllComplete?: (teamId: string, summary: string) => void,
+  onRuntimeStatus?: (status: TeamRuntimeStatus) => void,
 ): Promise<TeamRuntime> {
   const startMs = Date.now()
   logger.info({ teamId, activeTeamCount: activeTeams.size, event: 'team_lifecycle_start_begin' })
@@ -71,21 +77,90 @@ export async function startTeam(
   const ccInstances: CCInstance[] = []
   const ccSessionIds = new Map<string, string>()
 
-  for (let i = 0; i < members.length; i++) {
-    const member = members[i]
+  const memberRuntimes = members.map((member, i) => {
     const tmuxName = `${teamId.slice(0, 8)}-cc-${i}`
     const command = member.command || (member.agentType === 'codex' ? 'codex' : 'claude')
     const projectPath = member.projectPath || team.config.defaultProjectPath
+    const instance = createCCInstance(member.name, tmuxName, member.agentType, i)
+    return { member, tmuxName, command, projectPath, instance }
+  })
+
+  ccInstances.push(...memberRuntimes.map((runtime) => runtime.instance))
+
+  const buildStartupOverrides = (currentIndex?: number, currentStatus = 'starting') => {
+    const overrides: Record<string, string> = {}
+    for (let i = 0; i < ccInstances.length; i++) {
+      const instance = ccInstances[i]
+      if (currentIndex == null) {
+        overrides[instance.name] = 'queued'
+      } else if (i < currentIndex) {
+        overrides[instance.name] = instance.status
+      } else if (i === currentIndex) {
+        overrides[instance.name] = currentStatus
+      } else {
+        overrides[instance.name] = 'queued'
+      }
+    }
+    return overrides
+  }
+
+  const emitRuntimeStatus = (
+    startup: ReturnType<typeof buildTeamStartupStatus> | null,
+    daSessionId: string | null = null,
+    ccStatusOverrides?: Record<string, string>,
+  ) => {
+    onRuntimeStatus?.(
+      buildRunningTeamStatus({
+        teamId,
+        ccInstances,
+        daSessionId,
+        startup,
+        ccStatusOverrides,
+      }),
+    )
+  }
+
+  emitRuntimeStatus(
+    buildTeamStartupStatus({
+      phase: 'initializing',
+      readyCount: 0,
+      totalCount: ccInstances.length,
+    }),
+    null,
+    buildStartupOverrides(),
+  )
+
+  for (let i = 0; i < memberRuntimes.length; i++) {
+    const { member, tmuxName, command, projectPath, instance } = memberRuntimes[i]
 
     logger.info({ teamId, memberIndex: i, memberName: member.name, agentType: member.agentType, tmuxName, command, projectPath, event: 'cc_instance_starting' })
 
-    const instance = createCCInstance(member.name, tmuxName, member.agentType, i)
-    ccInstances.push(instance)
-
     try {
+      emitRuntimeStatus(
+        buildTeamStartupStatus({
+          phase: 'launching_cc',
+          readyCount: i,
+          totalCount: ccInstances.length,
+          currentCCName: member.name,
+        }),
+        null,
+        buildStartupOverrides(i),
+      )
+
       const ccStartMs = Date.now()
       await startCCInstance(instance, projectPath, command)
       logger.info({ teamId, memberName: member.name, tmuxName, latencyMs: Date.now() - ccStartMs, event: 'cc_instance_tmux_created' })
+
+      emitRuntimeStatus(
+        buildTeamStartupStatus({
+          phase: 'waiting_for_ready',
+          readyCount: i,
+          totalCount: ccInstances.length,
+          currentCCName: member.name,
+        }),
+        null,
+        buildStartupOverrides(i),
+      )
 
       const readyStartMs = Date.now()
       await waitCCReady(instance, 60000)
@@ -118,6 +193,15 @@ export async function startTeam(
     projectPath: team.config.defaultProjectPath,
   })
   logger.info({ teamId, daSessionId: daSessionDoc.sessionId, event: 'da_session_created' })
+
+  emitRuntimeStatus(
+    buildTeamStartupStatus({
+      phase: 'creating_da',
+      readyCount: ccInstances.length,
+      totalCount: ccInstances.length,
+    }),
+    daSessionDoc.sessionId,
+  )
 
   const da = createDelegateAgent(teamId, ccInstances)
   da.onStatusUpdate = (statuses) => onStatusUpdate?.(teamId, statuses)

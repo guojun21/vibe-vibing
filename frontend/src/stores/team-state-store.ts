@@ -26,12 +26,29 @@ export interface TeamCCSession {
   tmuxSessionName: string
 }
 
+export type TeamStartupPhase =
+  | 'initializing'
+  | 'launching_cc'
+  | 'waiting_for_ready'
+  | 'creating_da'
+  | 'complete'
+
+export interface TeamStartupStatus {
+  phase: TeamStartupPhase
+  message: string
+  readyCount: number
+  totalCount: number
+  currentCCName?: string
+}
+
 export interface TeamRuntimeStatus {
   teamId: string
   isRunning: boolean
   ccStatuses: Record<string, string>
   daSessionId: string | null
   ccSessions?: TeamCCSession[]
+  ccOutputFiles?: Record<string, string>
+  startup?: TeamStartupStatus | null
 }
 
 export interface DAMessage {

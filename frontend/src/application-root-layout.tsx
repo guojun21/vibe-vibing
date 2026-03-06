@@ -358,7 +358,8 @@ export default function App() {
         const existing = useTeamStore.getState().teamStatuses[message.status.teamId]
         setTeamStatus({
           ...message.status,
-          ccSessions: message.status.ccSessions ?? existing?.ccSessions ?? [],
+          ccSessions: (message.status as any).ccSessions ?? existing?.ccSessions ?? [],
+          startup: (message.status as any).startup !== undefined ? (message.status as any).startup : existing?.startup,
         })
       }
       if (message.type === 'team-started') {
@@ -370,6 +371,7 @@ export default function App() {
           ccStatuses: {},
           daSessionId: msg.daSessionId ?? null,
           ccSessions,
+          startup: null,
         })
       }
       if (message.type === 'da-message') {
@@ -634,7 +636,7 @@ export default function App() {
     <div className="flex h-full overflow-hidden">
       {/* Left column: header + sidebar - always hidden on mobile (drawer handles it) */}
       <div
-        className="hidden h-full flex-col md:flex md:shrink-0"
+        className="hidden h-full min-h-0 flex-col overflow-hidden md:flex md:shrink-0"
         style={{ width: sidebarWidth }}
       >
         <Header
@@ -644,7 +646,7 @@ export default function App() {
           tailscaleIp={serverInfo?.tailscaleIp ?? null}
         />
         <TeamSidebar sendMessage={sendMessage} />
-        <div className="h-px bg-white/10" />
+        <div className="h-px shrink-0 bg-white/10" />
         <SessionList
           sessions={sessions}
           inactiveSessions={agentSessions.inactive}

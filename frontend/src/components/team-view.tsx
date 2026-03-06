@@ -10,6 +10,7 @@ import TerminalInstance from './terminal-instance-with-independent-websocket'
 import DAPanel from './delegate-agent-chat-panel'
 import { useTeamStore, type TeamRuntimeStatus } from '../stores/team-state-store'
 import { useSessionStore } from '../stores/session-state-store'
+import { isTeamStartupInProgress, getTeamStartupDisplay } from '../utils/team-startup-display'
 
 interface TeamViewProps {
   teamId: string
@@ -72,8 +73,10 @@ export default function TeamView({ teamId, sendMessage }: TeamViewProps) {
   const { fraction, containerRef, onMouseDown } = useHorizontalResizer(0.3, 0.15, 0.5)
 
   const isRunning = status?.isRunning ?? false
+  const startingUp = isTeamStartupInProgress(status)
+  const startupDisplay = getTeamStartupDisplay(status)
 
-  if (!isRunning && ccSessions.length === 0) {
+  if (!isRunning && !startingUp && ccSessions.length === 0) {
     return (
       <div className="flex flex-col h-full">
         <div className="flex-1 min-h-0 overflow-hidden">
@@ -113,6 +116,14 @@ export default function TeamView({ teamId, sendMessage }: TeamViewProps) {
               </div>
             </Fragment>
           ))
+        ) : startupDisplay ? (
+          <div className="flex items-center justify-center h-full text-white/40 text-sm">
+            <div className="flex flex-col items-center gap-3">
+              <span className="inline-block w-3 h-3 rounded-full bg-blue-400 animate-pulse" />
+              <span className="text-white/60 font-medium">{startupDisplay.message}</span>
+              <span className="text-xs text-white/30">{startupDisplay.progressLabel}</span>
+            </div>
+          </div>
         ) : (
           <div className="flex items-center justify-center h-full text-white/30 text-sm">
             <div className="flex flex-col items-center gap-2">

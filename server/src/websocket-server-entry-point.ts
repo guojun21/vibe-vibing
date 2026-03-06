@@ -2604,6 +2604,9 @@ async function handleTeamStart(message: { teamId: string }, ws: ServerWebSocket<
         logger.debug({ reqId, teamId, summaryLen: summary.length, event: 'da_summary_broadcast' })
         broadcast({ type: 'da-message', teamId, message: { messageId: crypto.randomUUID(), teamId, role: 'da', content: summary, timestamp: new Date().toISOString() } } as any)
       },
+      (status) => {
+        broadcast({ type: 'team-status', status } as any)
+      },
     )
     const statuses: Record<string, string> = {}
     const ccOutputFiles: Record<string, string> = {}
@@ -2613,7 +2616,7 @@ async function handleTeamStart(message: { teamId: string }, ws: ServerWebSocket<
     }
     const ccSessions = runtime.ccInstances.map(inst => ({ name: inst.name, tmuxSessionName: inst.tmuxSessionName }))
     broadcast({ type: 'team-started', teamId: message.teamId, ccCount: runtime.ccInstances.length, daSessionId: runtime.daSessionId, ccSessions } as any)
-    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles, ccSessions } } as any)
+    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles, ccSessions, startup: null } } as any)
     logger.info({ reqId, teamId: message.teamId, ccCount: runtime.ccInstances.length, daSessionId: runtime.daSessionId, ccStatuses: statuses, latencyMs: Date.now() - startMs, event: 'team_start_success' })
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
@@ -2628,7 +2631,7 @@ async function handleTeamStop(message: { teamId: string }, ws: ServerWebSocket<W
   logger.info({ reqId, teamId: message.teamId, event: 'team_stop_begin' })
   try {
     await stopTeam(message.teamId)
-    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: false, ccStatuses: {}, daSessionId: null, ccSessions: [] } } as any)
+    broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: false, ccStatuses: {}, daSessionId: null, ccSessions: [], startup: null } } as any)
     logger.info({ reqId, teamId: message.teamId, latencyMs: Date.now() - startMs, event: 'team_stop_success' })
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
@@ -2657,6 +2660,9 @@ async function handleDAInputMessage(message: { teamId: string; text: string }, w
         (tid, summary) => {
           broadcast({ type: 'da-message', teamId: tid, message: { messageId: crypto.randomUUID(), teamId: tid, role: 'da', content: summary, timestamp: new Date().toISOString() } } as any)
         },
+        (status) => {
+          broadcast({ type: 'team-status', status } as any)
+        },
       )
       const statuses: Record<string, string> = {}
       const ccOutputFiles: Record<string, string> = {}
@@ -2665,7 +2671,7 @@ async function handleDAInputMessage(message: { teamId: string; text: string }, w
         ccOutputFiles[inst.name] = inst.outputFilePath
       }
       const ccSessions = runtime.ccInstances.map(inst => ({ name: inst.name, tmuxSessionName: inst.tmuxSessionName }))
-      broadcast({ type: 'team-status', status: { teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles, ccSessions } } as any)
+      broadcast({ type: 'team-status', status: { teamId, isRunning: true, ccStatuses: statuses, daSessionId: runtime.daSessionId, ccOutputFiles, ccSessions, startup: null } } as any)
       logger.info({ reqId, teamId, ccCount: runtime.ccInstances.length, event: 'da_input_auto_start_success' })
     } catch (startErr) {
       const errMsg = startErr instanceof Error ? startErr.message : String(startErr)
