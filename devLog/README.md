@@ -26,6 +26,7 @@ devLog/
 | [06](commits/06-2026-03-05-fix-splitview-overflow.md) | 2026-03-05 | 修复 SplitView 溢出 | fix |
 | [07](commits/07-2026-03-06-da-agent-loop.md) | 2026-03-06 | DA Agent Loop + LLM 驱动执行 | feat |
 | [08](commits/08-2026-03-06-infra-hardening.md) | 2026-03-06 | 基础设施加固 + 健康检查 | chore |
+| [09](commits/09-2026-03-06-restructure-devlog.md) | 2026-03-06 | devLog 结构化重构 + 模块文档 | docs |
 
 ---
 
