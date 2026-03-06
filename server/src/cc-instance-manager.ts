@@ -112,7 +112,7 @@ export async function startCCInstance(instance: CCInstance, workDir: string, com
   logger.info('cc_instance_started', { name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath })
 }
 
-export async function waitCCReady(instance: CCInstance, timeoutMs = 60000): Promise<void> {
+export async function waitCCReady(instance: CCInstance, timeoutMs = 120000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let trustHandled = false
   let unknownConsecutiveCount = 0
@@ -142,7 +142,8 @@ export async function waitCCReady(instance: CCInstance, timeoutMs = 60000): Prom
     }
 
     if (pollAttempt % 10 === 0) {
-      logger.info('cc_wait_ready_poll', { name: instance.name, status: instance.status, pollAttempt, elapsedMs: Date.now() - (deadline - timeoutMs) })
+      const tailPreview = (instance.content ?? '').split('\n').slice(-8).join(' | ')
+      logger.info('cc_wait_ready_poll', { name: instance.name, status: instance.status, pollAttempt, elapsedMs: Date.now() - (deadline - timeoutMs), tail: tailPreview })
     }
 
     if (instance.status === 'trust-prompt' && !trustHandled) {
@@ -160,12 +161,12 @@ export async function waitCCReady(instance: CCInstance, timeoutMs = 60000): Prom
   }
 
   const sessionExists = tmuxSessionExists(instance.tmuxSessionName)
-  const lastContentPreview = instance.content.slice(0, 200)
+  const lastContentTail = (instance.content ?? '').split('\n').slice(-15).join('\n')
   logger.error('cc_wait_ready_timeout', {
     name: instance.name,
     status: instance.status,
     sessionExists,
-    lastContentPreview,
+    lastContentTail,
     pollAttempt,
   })
   throw new Error(`${instance.name}: timed out waiting for CC to become ready (last status: ${instance.status})`)
