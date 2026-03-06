@@ -75,14 +75,23 @@ async function execWaitForIdle(
   const timeoutMs = (args.timeout_seconds ?? 120) * 1000
   const deadline = Date.now() + timeoutMs
   const pollInterval = 2000
+  let pollCount = 0
 
   while (Date.now() < deadline) {
     refreshCCInstance(cc)
+    pollCount++
+    if (pollCount % 5 === 0) {
+      const contentTail = (cc.content ?? '').split('\n').slice(-5).join(' | ')
+      logger.info('wait_for_idle_poll', { cc: cc.name, status: cc.status, pollCount, tail: contentTail })
+    }
     if (isIdleStatus(cc.status)) {
+      logger.info('wait_for_idle_resolved', { cc: cc.name, status: cc.status, pollCount, elapsedMs: timeoutMs - (deadline - Date.now()) })
       return `${cc.name} is now idle (status: ${cc.status}).`
     }
     await Bun.sleep(pollInterval)
   }
+  const contentTail = (cc.content ?? '').split('\n').slice(-10).join('\n')
+  logger.warn('wait_for_idle_timeout', { cc: cc.name, status: cc.status, pollCount, contentTail })
   return `[TIMEOUT] ${cc.name} did not become idle within ${args.timeout_seconds ?? 120}s. Current status: ${cc.status}`
 }
 
