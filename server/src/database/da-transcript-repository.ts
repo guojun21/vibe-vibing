@@ -174,6 +174,22 @@ export async function getTranscriptsByLoopId(
   return (memTranscripts.get(teamId) ?? []).filter((e) => e.loopId === loopId)
 }
 
+export async function getRecentTranscripts(
+  teamId: string,
+  limit = 200,
+): Promise<DATranscriptEvent[]> {
+  if (isMongoAvailable()) {
+    return transcriptCol()
+      .find({ teamId })
+      .sort({ timestamp: -1 })
+      .limit(limit)
+      .toArray()
+      .then((docs) => docs.reverse())
+  }
+  const all = memTranscripts.get(teamId) ?? []
+  return all.slice(-limit)
+}
+
 // ─── Conversation Summaries ───
 
 export async function saveSummary(summary: Omit<DAConversationSummary, '_id'>): Promise<void> {

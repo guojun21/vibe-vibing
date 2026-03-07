@@ -76,6 +76,7 @@ export default function App() {
     setDAMessages,
     addDAMessage,
     addDAAgentEvent,
+    setDAAgentEvents,
     clearDAAgentEvents,
     setDAAgentRunning,
   } = useTeamStore()
@@ -372,12 +373,16 @@ export default function App() {
           ccSessions,
           startup: null,
         })
+        sendMessage({ type: 'da-history-request', teamId: msg.teamId })
       }
       if (message.type === 'da-message') {
         addDAMessage(message.teamId, message.message)
       }
       if (message.type === 'da-history') {
         setDAMessages(message.teamId, message.messages)
+        if ((message as any).agentEvents?.length) {
+          setDAAgentEvents(message.teamId, (message as any).agentEvents)
+        }
       }
       if ((message as any).type === 'da-thinking') {
         const msg = message as any

@@ -55,6 +55,7 @@ import { SshTerminalProxy } from './terminal/ssh-remote-terminal-proxy'
 import { connectMongoDB, closeMongoDB, isMongoDBConnected } from './database/mongodb-connection'
 import * as teamRepo from './database/team-repository'
 import * as sessionRepo from './database/session-repository'
+import * as daTranscriptRepo from './database/da-transcript-repository'
 import { startTeam, stopTeam, sendDAInput, getDAHistory, getActiveTeam, getAllActiveTeams, abortAgentLoop } from './team-lifecycle-service'
 import type { DAToolCallInfo, DAToolResultInfo } from './shared/shared-message-and-session-types'
 
@@ -2808,12 +2809,40 @@ async function handleDAHistoryRequest(message: { teamId: string; limit?: number 
   const limit = message.limit || 100
   logger.info({ reqId, teamId: message.teamId, limit, event: 'da_history_request_start' })
   try {
-    const messages = await getDAHistory(message.teamId, limit)
-    send(ws, { type: 'da-history', teamId: message.teamId, messages: messages.map(m => ({ messageId: m.messageId, teamId: m.teamId, role: m.role, content: m.content, timestamp: m.timestamp.toISOString() })) } as any)
-    logger.info({ reqId, teamId: message.teamId, messageCount: messages.length, latencyMs: Date.now() - startMs, event: 'da_history_request_success' })
+    const [messages, transcripts] = await Promise.all([
+      getDAHistory(message.teamId, limit),
+      daTranscriptRepo.getRecentTranscripts(message.teamId, limit * 3),
+    ])
+
+    const agentEvents = transcripts
+      .filter((t) => t.type !== 'user_input')
+      .map((t) => ({
+        type: mapTranscriptType(t.type),
+        step: t.step,
+        content: t.content,
+        toolCalls: t.toolCalls,
+        toolResults: t.toolResults,
+        timestamp: t.timestamp.toISOString(),
+      }))
+
+    send(ws, {
+      type: 'da-history',
+      teamId: message.teamId,
+      messages: messages.map(m => ({ messageId: m.messageId, teamId: m.teamId, role: m.role, content: m.content, timestamp: m.timestamp.toISOString() })),
+      agentEvents,
+    } as any)
+    logger.info({ reqId, teamId: message.teamId, messageCount: messages.length, eventCount: agentEvents.length, latencyMs: Date.now() - startMs, event: 'da_history_request_success' })
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
     logger.error({ reqId, teamId: message.teamId, error: errMsg, latencyMs: Date.now() - startMs, event: 'da_history_request_error' })
     send(ws, { type: 'error', message: errMsg })
+  }
+}
+
+function mapTranscriptType(type: string): string {
+  switch (type) {
+    case 'tool_call': return 'tool-call'
+    case 'tool_result': return 'tool-result'
+    default: return type
   }
 }

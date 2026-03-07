@@ -98,6 +98,7 @@ interface TeamState {
   setDAMessages: (teamId: string, messages: DAMessage[]) => void
   addDAMessage: (teamId: string, message: DAMessage) => void
   addDAAgentEvent: (teamId: string, event: DAAgentEvent) => void
+  setDAAgentEvents: (teamId: string, events: DAAgentEvent[]) => void
   clearDAAgentEvents: (teamId: string) => void
   setDAAgentRunning: (teamId: string, running: boolean) => void
   setCreatingTeam: (creating: boolean) => void
@@ -142,6 +143,10 @@ export const useTeamStore = create<TeamState>()(
             ...state.daAgentEvents,
             [teamId]: [...(state.daAgentEvents[teamId] || []), event],
           },
+        })),
+      setDAAgentEvents: (teamId, events) =>
+        set((state) => ({
+          daAgentEvents: { ...state.daAgentEvents, [teamId]: events },
         })),
       clearDAAgentEvents: (teamId) =>
         set((state) => ({
