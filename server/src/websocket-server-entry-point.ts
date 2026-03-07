@@ -191,7 +191,9 @@ logger.info('terminal_mode_resolved', {
 
 const app = new Hono()
 const db = initDatabase()
-void connectMongoDB().catch(err => logger.warn('mongodb_connect_failed', { error: String(err) }))
+void connectMongoDB()
+  .then(() => Promise.all([teamRepo.migrateFileStoreToMongo(), sessionRepo.migrateFileStoreToMongo()]))
+  .catch(err => logger.warn('mongodb_connect_failed', { error: String(err) }))
 
 // Read mouse mode setting from DB (default: true)
 const TMUX_MOUSE_MODE_KEY = 'tmux_mouse_mode'
@@ -2609,7 +2611,7 @@ async function handleTeamDelete(message: { teamId: string }, ws: ServerWebSocket
   const reqId = `td_${Date.now()}`
   logger.info({ reqId, teamId: message.teamId, event: 'team_delete_start' })
   try {
-    await stopTeam(message.teamId)
+    await stopTeam(message.teamId, resolveAgentSessionIdFromRegistry, true)
     logger.info({ reqId, teamId: message.teamId, event: 'team_delete_stopped' })
     await teamRepo.archiveTeam(message.teamId)
     const teams = await teamRepo.listAllTeams()
@@ -2659,12 +2661,22 @@ async function handleTeamStart(message: { teamId: string }, ws: ServerWebSocket<
   }
 }
 
+function resolveAgentSessionIdFromRegistry(tmuxSessionName: string): string | undefined {
+  const sessions = registry.getAll()
+  for (const s of sessions) {
+    if (s.tmuxWindow?.includes(tmuxSessionName) && s.agentSessionId) {
+      return s.agentSessionId
+    }
+  }
+  return undefined
+}
+
 async function handleTeamStop(message: { teamId: string }, ws: ServerWebSocket<WSData>) {
   const startMs = Date.now()
   const reqId = `tp_${Date.now()}`
   logger.info({ reqId, teamId: message.teamId, event: 'team_stop_begin' })
   try {
-    await stopTeam(message.teamId)
+    await stopTeam(message.teamId, resolveAgentSessionIdFromRegistry)
     broadcast({ type: 'team-status', status: { teamId: message.teamId, isRunning: false, ccStatuses: {}, daSessionId: null, ccSessions: [], startup: null } } as any)
     logger.info({ reqId, teamId: message.teamId, latencyMs: Date.now() - startMs, event: 'team_stop_success' })
   } catch (err) {

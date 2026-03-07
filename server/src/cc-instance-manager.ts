@@ -86,15 +86,46 @@ function attachPipePane(session: string, outputFile: string): void {
   runTmux(['pipe-pane', '-t', session, `-o`, `cat >> "${outputFile}"`])
 }
 
+/**
+ * Start (or reuse) a CC instance.
+ * If the tmux session already exists and CC is idle inside it, we simply
+ * re-attach the pipe-pane so monitoring resumes — the terminal scrollback
+ * with all prior conversation history is preserved.
+ * Otherwise we create a fresh tmux session with the given command.
+ */
 export async function startCCInstance(instance: CCInstance, workDir: string, command = 'claude'): Promise<void> {
   ensureTmuxServer()
-  if (tmuxSessionExists(instance.tmuxSessionName)) {
+
+  const sessionAlive = tmuxSessionExists(instance.tmuxSessionName)
+
+  if (sessionAlive) {
+    // Try to detect whether the existing session still has a running Claude
+    try {
+      const content = capturePaneContent(instance.tmuxSessionName)
+      const status = detectCCStatus(content)
+      if (isIdleStatus(status) || status === 'processing' || status === 'completed') {
+        // Session is alive with a Claude inside — reuse it
+        instance.content = content
+        instance.status = status
+        logger.info('cc_instance_reused', { name: instance.name, session: instance.tmuxSessionName, status })
+        await reattachPipePane(instance)
+        return
+      }
+    } catch {
+      // capture failed, fall through to kill+recreate
+    }
     killTmuxSession(instance.tmuxSessionName)
+    logger.info('cc_instance_killed_stale', { name: instance.name, session: instance.tmuxSessionName })
   }
+
   createTmuxSession(instance.tmuxSessionName, workDir, command)
-
   await Bun.sleep(1000)
+  await reattachPipePane(instance)
 
+  logger.info('cc_instance_started', { name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath, reused: false })
+}
+
+async function reattachPipePane(instance: CCInstance): Promise<void> {
   try {
     attachPipePane(instance.tmuxSessionName, instance.outputFilePath)
     logger.info('cc_pipe_pane_attached', { name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath })
@@ -108,8 +139,6 @@ export async function startCCInstance(instance: CCInstance, workDir: string, com
       logger.warn('cc_pipe_pane_attach_retry_failed', { name: instance.name, error: retryErr instanceof Error ? retryErr.message : String(retryErr) })
     }
   }
-
-  logger.info('cc_instance_started', { name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath })
 }
 
 export async function waitCCReady(instance: CCInstance, timeoutMs = 120000): Promise<void> {
@@ -192,10 +221,17 @@ export function refreshCCInstance(instance: CCInstance, pollAttempt?: number): v
   }
 }
 
-export function stopCCInstance(instance: CCInstance): void {
+/**
+ * Detach monitoring from a CC instance without killing the tmux session.
+ * The tmux session stays alive so it can be reused on next Start,
+ * preserving the terminal scrollback (conversation history).
+ */
+export function stopCCInstance(instance: CCInstance, keepSession = true): void {
   try { runTmux(['pipe-pane', '-t', instance.tmuxSessionName]) } catch {}
-  killTmuxSession(instance.tmuxSessionName)
-  logger.info('cc_instance_stopped', { name: instance.name, session: instance.tmuxSessionName, outputFile: instance.outputFilePath })
+  if (!keepSession) {
+    killTmuxSession(instance.tmuxSessionName)
+  }
+  logger.info('cc_instance_stopped', { name: instance.name, session: instance.tmuxSessionName, kept: keepSession })
 }
 
 export function sendInputToCCInstance(instance: CCInstance, text: string): void {

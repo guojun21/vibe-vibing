@@ -1,11 +1,11 @@
 import { logger } from './structured-pino-logger'
 
 const THALAMUS_BASE_URL = process.env.THALAMUS_URL || 'http://localhost:3013'
-const THALAMUS_MODEL = process.env.THALAMUS_MODEL || 'grok-code-fast-1'
+const THALAMUS_MODEL = process.env.THALAMUS_MODEL || 'fast'
 const THALAMUS_API_KEY = process.env.THALAMUS_API_KEY || 'sk-placeholder'
 
 const MAX_CONCURRENCY = parseInt(process.env.THALAMUS_MAX_CONCURRENCY || '1', 10)
-const QUEUE_TIMEOUT_MS = parseInt(process.env.THALAMUS_QUEUE_TIMEOUT_MS || '60000', 10)
+const QUEUE_TIMEOUT_MS = parseInt(process.env.THALAMUS_QUEUE_TIMEOUT_MS || '300000', 10)
 const MIN_INTERVAL_MS = parseInt(process.env.THALAMUS_MIN_INTERVAL_MS || '500', 10)
 
 export interface ChatMessage {
@@ -160,7 +160,7 @@ export async function callThalamus(
         'Authorization': `Bearer ${THALAMUS_API_KEY}`,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(300_000),
     })
 
     const respStatus = resp.status

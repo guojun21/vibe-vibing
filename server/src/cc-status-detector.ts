@@ -26,17 +26,17 @@ export function detectCCStatus(content: string): CCStatus {
   const clean = stripAnsi(content)
   const tail = tailContent(clean)
 
-  // Trust prompt and permission checks on tail — these appear at the bottom
-  if (TRUST_PROMPT_PATTERN.test(tail)) return 'trust-prompt'
-  if (PERMISSION_PATTERN.test(tail)) return 'permission'
-
-  // Idle/completed detection on tail — the prompt is always at the bottom
+  // Idle/completed first — if the prompt is visible, CC is ready regardless of
+  // historical trust-prompt text still in the scrollback buffer
   const hasIdlePrompt = IDLE_PROMPT_PATTERN.test(tail) || tail.includes(SHORTCUTS_HINT)
   const hasResponse = RESPONSE_PATTERN.test(clean)
   if (hasResponse && hasIdlePrompt) return 'completed'
   if (hasIdlePrompt) return 'idle'
 
-  // Only check processing on tail — spinners in scroll history should not count
+  // Trust prompt and permission — only match if CC is NOT idle
+  if (TRUST_PROMPT_PATTERN.test(tail)) return 'trust-prompt'
+  if (PERMISSION_PATTERN.test(tail)) return 'permission'
+
   if (PROCESSING_PATTERN.test(tail)) return 'processing'
   if (WAITING_ANSWER_PATTERN.test(tail)) return 'processing'
 

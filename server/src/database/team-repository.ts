@@ -70,6 +70,27 @@ function collection(): Collection<TeamDocument> {
   return getDb().collection<TeamDocument>('teams')
 }
 
+/**
+ * Migrate local teams.json → MongoDB on first connect.
+ * Skips teams that already exist in Mongo (idempotent).
+ */
+export async function migrateFileStoreToMongo(): Promise<void> {
+  if (!isMongoAvailable() || fileStore.size === 0) return
+  const coll = collection()
+  const existing = await coll.countDocuments()
+  if (existing > 0) {
+    logger.info('team_migration_skipped', { reason: 'mongo_not_empty', mongoCount: existing, fileCount: fileStore.size })
+    return
+  }
+  const docs = [...fileStore.values()].map(t => {
+    const { _id, ...rest } = t as any
+    return rest as TeamDocument
+  })
+  if (docs.length === 0) return
+  await coll.insertMany(docs)
+  logger.info('team_migration_completed', { migratedCount: docs.length })
+}
+
 export async function createTeam(name: string, members: TeamMemberConfig[], defaultProjectPath: string): Promise<TeamDocument> {
   const doc: TeamDocument = {
     teamId: randomUUID(),
@@ -81,10 +102,9 @@ export async function createTeam(name: string, members: TeamMemberConfig[], defa
   }
   if (isMongoAvailable()) {
     await collection().insertOne(doc)
-  } else {
-    fileStore.set(doc.teamId, doc)
-    saveFileStore(fileStore)
   }
+  fileStore.set(doc.teamId, doc)
+  saveFileStore(fileStore)
   return doc
 }
 
@@ -113,25 +133,27 @@ export async function listAllTeams(): Promise<TeamDocument[]> {
 }
 
 export async function updateTeam(teamId: string, updates: Partial<Pick<TeamDocument, 'name' | 'config' | 'status'>>): Promise<TeamDocument | null> {
+  let result: TeamDocument | null = null
   if (isMongoAvailable()) {
-    return collection().findOneAndUpdate(
+    result = await collection().findOneAndUpdate(
       { teamId },
       { $set: { ...updates, updatedAt: new Date() } },
       { returnDocument: 'after' }
     )
   }
   const existing = fileStore.get(teamId)
-  if (!existing) return null
-  const updated = { ...existing, ...updates, updatedAt: new Date() }
-  fileStore.set(teamId, updated)
-  saveFileStore(fileStore)
-  return updated
+  if (existing) {
+    const updated = { ...existing, ...updates, updatedAt: new Date() }
+    fileStore.set(teamId, updated)
+    saveFileStore(fileStore)
+    if (!result) result = updated
+  }
+  return result
 }
 
 export async function archiveTeam(teamId: string): Promise<void> {
   if (isMongoAvailable()) {
     await collection().updateOne({ teamId }, { $set: { status: 'archived', updatedAt: new Date() } })
-    return
   }
   const existing = fileStore.get(teamId)
   if (existing) {
@@ -144,7 +166,6 @@ export async function archiveTeam(teamId: string): Promise<void> {
 export async function deleteTeam(teamId: string): Promise<void> {
   if (isMongoAvailable()) {
     await collection().deleteOne({ teamId })
-    return
   }
   fileStore.delete(teamId)
   saveFileStore(fileStore)
