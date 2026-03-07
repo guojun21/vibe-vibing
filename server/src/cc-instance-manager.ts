@@ -21,15 +21,23 @@ function tmuxSessionExists(name: string): boolean {
 
 function ensureTmuxServer(): void {
   Bun.spawnSync(['tmux', 'start-server'])
+  try {
+    Bun.spawnSync(['tmux', 'set-environment', '-g', 'TERM', 'xterm-256color'])
+    Bun.spawnSync(['tmux', 'set-environment', '-g', 'FORCE_COLOR', '1'])
+    Bun.spawnSync(['tmux', 'set-environment', '-g', 'COLORTERM', 'truecolor'])
+    Bun.spawnSync(['tmux', 'set-option', '-g', 'default-terminal', 'xterm-256color'])
+  } catch {}
 }
 
 function createTmuxSession(name: string, dir: string, program: string): void {
   if (tmuxSessionExists(name)) {
     throw new Error(`tmux session "${name}" already exists`)
   }
-  const shellCmd = `source ~/.zshrc 2>/dev/null; [ -s "$HOME/.nvm/nvm.sh" ] && source "$HOME/.nvm/nvm.sh" && nvm use 22 2>/dev/null; export PATH="$HOME/.claude/local:$HOME/.local/bin:$PATH"; exec ${program}`
+  const shellCmd = `source ~/.zshrc 2>/dev/null; [ -s "$HOME/.nvm/nvm.sh" ] && source "$HOME/.nvm/nvm.sh" && nvm use 22 2>/dev/null; export TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=3 PATH="$HOME/.claude/local:$HOME/.local/bin:$PATH"; exec ${program}`
   runTmux(['new-session', '-d', '-s', name, '-c', dir, '-x', '120', '-y', '40', '--', 'zsh', '-c', shellCmd])
   try { runTmux(['set-option', '-t', name, 'history-limit', '10000']) } catch {}
+  try { runTmux(['set-option', '-t', name, 'default-terminal', 'xterm-256color']) } catch {}
+  try { runTmux(['set-option', '-t', name, 'mouse', 'on']) } catch {}
   try { runTmux(['set-option', '-t', name, 'status', 'off']) } catch {}
   try { runTmux(['set-option', '-t', name, 'prefix', 'None']) } catch {}
   try { runTmux(['set-option', '-t', name, 'prefix2', 'None']) } catch {}

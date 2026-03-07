@@ -18,6 +18,14 @@ const MAX_ITERATIONS = 30
 const MAX_CONTEXT_MESSAGES = 60
 const RECENT_ROUNDS_WINDOW = 10
 const MAX_RECENT_TOKENS = 4000
+const MAX_SAME_PATTERN_REPEATS = 3
+
+function toolCallSignature(toolCalls: ToolCall[]): string {
+  return toolCalls
+    .map((tc) => tc.function.name)
+    .sort()
+    .join(',')
+}
 
 export interface AgentLoopCallbacks {
   onThinking: (content: string) => void
@@ -170,6 +178,10 @@ export async function runAgentLoop(
       { role: 'user', content: userText },
     ]
 
+    let lastToolSig = ''
+    let samePatternCount = 0
+    let forceStopIssued = false
+
     for (let step = 1; step <= MAX_ITERATIONS; step++) {
       if (abortController.signal.aborted) {
         logger.info('da_agent_loop_abort_detected', { teamId, loopId, roundNumber, step })
@@ -181,7 +193,7 @@ export async function runAgentLoop(
       const stepStartMs = Date.now()
       logger.info('da_agent_step_start', { teamId, loopId, roundNumber, step, messageCount: messages.length })
 
-      const response = await callThalamus(messages, DA_TOOL_DEFINITIONS)
+      const response = await callThalamus(messages, forceStopIssued ? [] : DA_TOOL_DEFINITIONS)
 
       messages.push(response.message)
 
@@ -222,6 +234,47 @@ export async function runAgentLoop(
         return
       }
 
+      if (forceStopIssued) {
+        const forceSummary = response.message.content || '[DA force-stopped: model kept calling tools after repetition warning]'
+        logger.warn('da_agent_loop_force_stopped', {
+          teamId, loopId, roundNumber, step,
+          toolCallsIgnored: response.message.tool_calls!.map((tc) => tc.function.name),
+        })
+        await appendTranscript({ teamId, loopId, roundNumber, step, type: 'complete', content: forceSummary })
+        callbacks.onComplete(forceSummary)
+        maybeTriggerSummary(teamId, roundNumber).catch((err) => {
+          logger.error('da_summary_trigger_fire_and_forget_error', { teamId, roundNumber, error: String(err) })
+        })
+        return
+      }
+
+      const currentSig = toolCallSignature(response.message.tool_calls!)
+      if (currentSig === lastToolSig) {
+        samePatternCount++
+      } else {
+        lastToolSig = currentSig
+        samePatternCount = 1
+      }
+
+      if (samePatternCount >= MAX_SAME_PATTERN_REPEATS) {
+        logger.warn('da_agent_loop_repetition_detected', {
+          teamId, loopId, roundNumber, step,
+          pattern: currentSig,
+          repeatCount: samePatternCount,
+        })
+        forceStopIssued = true
+
+        messages.push({
+          role: 'user',
+          content:
+            `[SYSTEM] You have repeated the exact same tool call pattern (${currentSig}) ${samePatternCount} times in a row. ` +
+            'The task appears to be complete based on prior tool results. ' +
+            'You MUST now stop calling tools and provide a final summary of what was accomplished. ' +
+            'Do NOT call any more tools. Just respond with your final report.',
+        })
+        continue
+      }
+
       await appendTranscript({
         teamId, loopId, roundNumber, step,
         type: 'tool_call',
@@ -260,6 +313,7 @@ export async function runAgentLoop(
         teamId, loopId, roundNumber, step,
         toolResultCount: toolResults.length,
         errCount: toolResults.filter((r) => r.isError).length,
+        samePatternCount,
         stepLatencyMs: Date.now() - stepStartMs,
       })
     }

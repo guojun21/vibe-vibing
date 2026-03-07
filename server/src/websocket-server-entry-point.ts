@@ -2341,10 +2341,14 @@ async function attachTerminalPersistent(
 
   const effectiveTarget = terminal.resolveEffectiveTarget(target)
 
-  // Capture scrollback history BEFORE switching to avoid race with live output
-  const history = session.remote && session.host
-    ? await captureTmuxHistoryRemote(effectiveTarget, session.host)
-    : captureTmuxHistory(effectiveTarget)
+  // In PTY mode tmux attach + refresh-client sends colored screen content
+  // via the PTY stream, so skip the plain-text capture-pane history.
+  const proxyMode = terminal.getMode()
+  const history = proxyMode === 'pty'
+    ? null
+    : session.remote && session.host
+      ? await captureTmuxHistoryRemote(effectiveTarget, session.host)
+      : captureTmuxHistory(effectiveTarget)
 
   const tCapture = performance.now()
 
@@ -2400,16 +2404,14 @@ async function attachTerminalPersistent(
 
 function captureTmuxHistory(target: string): string | null {
   try {
-    // Capture full scrollback history (-S - means from start, -E - means to end, -J joins wrapped lines)
     const result = Bun.spawnSync(
-      ['tmux', 'capture-pane', '-t', target, '-p', '-S', '-', '-E', '-', '-J'],
+      ['tmux', 'capture-pane', '-t', target, '-p', '-e', '-S', '-', '-E', '-', '-J'],
       { stdout: 'pipe', stderr: 'pipe' }
     )
     if (result.exitCode !== 0) {
       return null
     }
     const output = result.stdout.toString()
-    // Only return if there's actual content
     if (output.trim().length === 0) {
       return null
     }
@@ -2468,7 +2470,7 @@ async function runRemoteSsh(host: string, remoteCmd: string): Promise<{ exitCode
 
 async function captureTmuxHistoryRemote(target: string, host: string): Promise<string | null> {
   try {
-    const result = await runRemoteTmux(host, ['capture-pane', '-t', target, '-p', '-S', '-', '-E', '-', '-J'])
+    const result = await runRemoteTmux(host, ['capture-pane', '-t', target, '-p', '-e', '-S', '-', '-E', '-', '-J'])
     if (result.exitCode !== 0) return null
     const output = result.stdout ?? ''
     if (output.trim().length === 0) return null

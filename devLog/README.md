@@ -1,4 +1,4 @@
-# devLog — Vibe Curlaude 开发日志
+# devLog — Vibe Vibing 开发日志
 
 ## 目录结构
 
@@ -6,7 +6,8 @@
 devLog/
 ├── README.md           ← 本文件，索引
 ├── commits/            ← 按 commit 的开发日志（变更记录）
-└── modules/            ← 模块架构文档（系统介绍）
+├── modules/            ← 模块架构文档（系统介绍）
+└── 需求文档/            ← 功能需求设计文档
 ```
 
 ---
@@ -27,6 +28,8 @@ devLog/
 | [07](commits/07-2026-03-06-da-agent-loop.md) | 2026-03-06 | DA Agent Loop + LLM 驱动执行 | feat |
 | [08](commits/08-2026-03-06-infra-hardening.md) | 2026-03-06 | 基础设施加固 + 健康检查 | chore |
 | [09](commits/09-2026-03-06-restructure-devlog.md) | 2026-03-06 | devLog 结构化重构 + 模块文档 | docs |
+| [10](commits/10-2026-03-06-unified-team-session-sidebar.md) | 2026-03-06 | 统一 Team-Session 左侧栏设计 | feat |
+| [11](commits/11-2026-03-07-cc-terminal-color-and-scroll.md) | 2026-03-07 | CC 终端颜色渲染 + 鼠标滚轮 + DA 防重复 | fix |
 
 ---
 
@@ -45,3 +48,11 @@ devLog/
 | [07](modules/07-frontend-ui.md) | 前端 UI | React 组件层次、Zustand 状态管理、WebSocket 通信 |
 | [08](modules/08-logging-system.md) | 日志系统 | Pino 结构化日志、事件名索引 |
 | [09](modules/09-database-persistence.md) | 数据库持久化 | MongoDB / 本地文件双存储、健康检查 |
+
+---
+
+## 需求文档/ — 功能需求设计
+
+| 文档 | 说明 |
+|------|------|
+| [DA 对话记忆设计](需求文档/2026-03-07-da-conversation-memory-design.md) | DA 对话持久化、自动摘要、上下文注入、历史查询工具 |

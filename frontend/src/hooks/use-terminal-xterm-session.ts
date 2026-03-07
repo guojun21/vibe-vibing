@@ -327,15 +327,14 @@ export function useTerminal({
       fontSize,
       lineHeight: computedLineHeight,
       letterSpacing,
-      scrollback: 0, // Disabled - we use tmux scrollback instead
-      cursorBlink: false,
-      cursorStyle: 'underline',
+      scrollback: 0,
+      cursorBlink: true,
+      cursorStyle: 'bar',
+      cursorInactiveStyle: 'bar',
       convertEol: true,
       theme,
       screenReaderMode: isiOS,
-      // Ensure text is readable even when apps use true color (24-bit RGB) sequences
-      // that bypass our theme colors (e.g., Pi using black text on dark backgrounds)
-      minimumContrastRatio: 4.5,
+      minimumContrastRatio: 1,
     })
 
     const fitAddon = new FitAddon()
