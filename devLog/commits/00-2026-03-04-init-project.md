@@ -1,4 +1,4 @@
-# [57ea6ca] init: Vibe Curlaude project with design README
+# [57ea6ca] init: Vibe Vibing project with design README
 
 **Date:** 2026-03-04
 

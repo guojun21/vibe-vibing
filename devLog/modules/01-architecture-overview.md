@@ -2,7 +2,7 @@
 
 ## 系统定位
 
-Vibe Curlaude (Agentboard) 是一个 **AI Agent 编排平台**，通过 Web UI 管理多个 Claude Code CLI 实例。核心理念是"委托"——Delegate Agent (DA) 作为项目经理，通过 tmux 控制多个 Claude Code (CC) 工人实例完成开发任务。
+Vibe Vibing (Agentboard) 是一个 **AI Agent 编排平台**，通过 Web UI 管理多个 Claude Code CLI 实例。核心理念是"委托"——Delegate Agent (DA) 作为项目经理，通过 tmux 控制多个 Claude Code (CC) 工人实例完成开发任务。
 
 ## 技术栈
 

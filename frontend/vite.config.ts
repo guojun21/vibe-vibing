@@ -36,8 +36,8 @@ export default defineConfig(({ mode }) => {
       VitePWA({
         registerType: 'autoUpdate',
         manifest: {
-          name: 'Vibe Curlaude',
-          short_name: 'Curlaude',
+          name: 'Vibe Vibing',
+          short_name: 'Vibing',
           description: 'AI Delegate Agent orchestrating multiple Claude Code instances',
           theme_color: '#0f172a',
           background_color: '#0f172a',

@@ -1,6 +1,6 @@
 # Quick Start
 
-5 分钟跑起来 Vibe Curlaude。
+5 分钟跑起来 Vibe Vibing。
 
 ## 前提条件
 
